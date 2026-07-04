@@ -656,13 +656,15 @@ func (self *ClientStrategy) serialEval(ctx context.Context, eval func(ctx contex
 			result := eval(handleCtx, dialer)
 			if result != nil {
 				if result.err == nil {
-					if self.log.V(2).Enabled() {
-						self.log.Infof("[net][s]select: %s\n", dialer.String())
-					}
+					self.log.Infof("[net][s]select: %s\n", dialer.String())
 					return result
 				}
-				if self.log.V(2).Enabled() {
-					self.log.Infof("[net][s]select: %s = %s\n", dialer.String(), result.err)
+				if ok, suppressed := shouldLogSelectErr(); ok {
+					if suppressed > 0 {
+						self.log.Infof("[net][s]select: %s = %s (%d suppressed)\n", dialer.String(), result.err, suppressed)
+					} else {
+						self.log.Infof("[net][s]select: %s = %s\n", dialer.String(), result.err)
+					}
 				}
 				result.Close()
 			}

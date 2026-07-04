@@ -24,6 +24,16 @@ import (
 	"github.com/urnetwork/connect/protocol"
 )
 
+var (
+	authErrThrottle   = newLogThrottle(time.Minute)
+	selectErrThrottle = newLogThrottle(time.Minute)
+	writeErrThrottle  = newLogThrottle(time.Minute)
+)
+
+func shouldLogAuthErr() (bool, int64)   { return authErrThrottle.Allow(time.Now()) }
+func shouldLogSelectErr() (bool, int64) { return selectErrThrottle.Allow(time.Now()) }
+func shouldLogWriteErr() (bool, int64)  { return writeErrThrottle.Allow(time.Now()) }
+
 // note that it is possible to have multiple transports for the same client destination
 // e.g. platform, p2p, and a bunch of extenders
 
@@ -494,7 +504,13 @@ func (self *PlatformTransport) runH1(initialTimeout time.Duration) {
 			ws, err = connect()
 		}
 		if err != nil {
-			self.log.Infof("[t]auth error %s = %s\n", clientId, err)
+			if ok, suppressed := shouldLogAuthErr(); ok {
+				if suppressed > 0 {
+					self.log.Infof("[t]auth error %s = %s (%d suppressed)\n", clientId, err, suppressed)
+				} else {
+					self.log.Infof("[t]auth error %s = %s\n", clientId, err)
+				}
+			}
 			select {
 			case <-self.ctx.Done():
 				return
@@ -642,8 +658,13 @@ func (self *PlatformTransport) runH1(initialTimeout time.Duration) {
 					err := ws.WriteMessage(websocket.BinaryMessage, message)
 					MessagePoolReturn(message)
 					if err != nil {
-						// note that for websocket a dealine timeout cannot be recovered
-						self.log.Infof("[ts]%s-> error = %s\n", clientId, err)
+						if ok, suppressed := shouldLogWriteErr(); ok {
+							if suppressed > 0 {
+								self.log.Infof("[ts]%s-> error = %s (%d suppressed)\n", clientId, err, suppressed)
+							} else {
+								self.log.Infof("[ts]%s-> error = %s\n", clientId, err)
+							}
+						}
 						return err
 					}
 					if self.log.V(2).Enabled() {
@@ -1091,7 +1112,13 @@ func (self *PlatformTransport) runH3(ptMode TransportMode, initialTimeout time.D
 			connStream, err = connect()
 		}
 		if err != nil {
-			self.log.Infof("[t]auth error %s = %s\n", clientId, err)
+			if ok, suppressed := shouldLogAuthErr(); ok {
+				if suppressed > 0 {
+					self.log.Infof("[t]auth error %s = %s (%d suppressed)\n", clientId, err, suppressed)
+				} else {
+					self.log.Infof("[t]auth error %s = %s\n", clientId, err)
+				}
+			}
 			select {
 			case <-self.ctx.Done():
 				return
@@ -1212,8 +1239,13 @@ func (self *PlatformTransport) runH3(ptMode TransportMode, initialTimeout time.D
 						err := framer.Write(stream, message)
 						MessagePoolReturn(message)
 						if err != nil {
-							// note that for websocket a dealine timeout cannot be recovered
-							self.log.Infof("[ts]%s-> error = %s\n", clientId, err)
+							if ok, suppressed := shouldLogWriteErr(); ok {
+								if suppressed > 0 {
+									self.log.Infof("[ts]%s-> error = %s (%d suppressed)\n", clientId, err, suppressed)
+								} else {
+									self.log.Infof("[ts]%s-> error = %s\n", clientId, err)
+								}
+							}
 							return
 						}
 						if self.log.V(2).Enabled() {
