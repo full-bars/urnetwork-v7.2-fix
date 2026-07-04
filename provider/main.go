@@ -529,7 +529,7 @@ func provide(opts docopt.Opts) {
 				if waitErr != nil {
 					return "", connect.Id{}, waitErr
 				}
-				byClientJwt, clientId, err := provideAuth(proxyCtx, clientStrategy, apiUrl, opts)
+				byClientJwt, clientId, err := provideAuth(proxyCtx, clientStrategy, apiUrl, opts, os.Getenv("URNETWORK_NODE_NAME"))
 				if proxySettings != nil {
 					if err == nil {
 						globalProvenProxies.MarkSucceeded(proxySettings.Address)
@@ -1111,7 +1111,7 @@ func writeProviderTlsCertAndKey(certPem, keyPem []byte) error {
 	return os.WriteFile(p, out, 0600)
 }
 
-func provideAuth(ctx context.Context, clientStrategy *connect.ClientStrategy, apiUrl string, opts docopt.Opts) (byClientJwt string, clientId connect.Id, returnErr error) {
+func provideAuth(ctx context.Context, clientStrategy *connect.ClientStrategy, apiUrl string, opts docopt.Opts, nodeName string) (byClientJwt string, clientId connect.Id, returnErr error) {
 	home, err := os.UserHomeDir()
 	if err != nil {
 		panic(err)
