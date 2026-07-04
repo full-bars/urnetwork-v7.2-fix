@@ -409,6 +409,7 @@ func provide(opts docopt.Opts) {
 
 	go runOutageWatcher(ctx, os.Getenv("URNETWORK_NODE_NAME"), os.Getenv("URNETWORK_ALERT_WEBHOOK"))
 	go runHealthHeartbeat(ctx, provideStartTime, os.Getenv("URNETWORK_PROFILE"))
+	go runJWTRefresher(ctx, apiUrl)
 
 	provideWithProxy := func(proxySettings *connect.ProxySettings) {
 		proxyCtx, proxyCancel := context.WithCancel(ctx)
@@ -1339,4 +1340,137 @@ func writeProxyConfig(proxyConfig *ProxyConfig) {
 	if err != nil {
 		panic(err)
 	}
+}
+
+func parseJWTExpiryTime(byJwt string) *time.Time {
+	parser := gojwt.NewParser()
+	tok, _, err := parser.ParseUnverified(byJwt, gojwt.MapClaims{})
+	if err != nil {
+		return nil
+	}
+	claims, ok := tok.Claims.(gojwt.MapClaims)
+	if !ok {
+		return nil
+	}
+	exp, ok := claims["exp"].(float64)
+	if !ok {
+		return nil
+	}
+	t := time.Unix(int64(exp), 0)
+	return &t
+}
+
+func refreshJWT(ctx context.Context, apiUrl, byJwt string) (string, error) {
+	clientStrategy := connect.NewClientStrategyWithDefaults(ctx)
+	api := connect.NewBringYourApi(ctx, clientStrategy, apiUrl)
+	api.SetByJwt(byJwt)
+	callback, channel := connect.NewBlockingApiCallback[*connect.AuthNetworkClientResult](ctx)
+	api.AuthNetworkClient(&connect.AuthNetworkClientArgs{
+		Description: "jwt-refresh",
+		DeviceSpec:  "",
+	}, callback)
+	var result connect.ApiCallbackResult[*connect.AuthNetworkClientResult]
+	select {
+	case <-ctx.Done():
+		return "", ctx.Err()
+	case result = <-channel:
+	}
+	if result.Error != nil {
+		return "", fmt.Errorf("api error: %w", result.Error)
+	}
+	if result.Result == nil {
+		return "", fmt.Errorf("empty result from auth API")
+	}
+	if result.Result.Error != nil {
+		return "", fmt.Errorf("auth rejected: %s", result.Result.Error.Message)
+	}
+	if result.Result.ByClientJwt == "" {
+		return "", fmt.Errorf("empty ByClientJwt in response")
+	}
+	return result.Result.ByClientJwt, nil
+}
+
+func runJWTRefresher(ctx context.Context, apiUrl string) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return
+	}
+	jwtPath := filepath.Join(home, ".urnetwork", "jwt")
+	lastRefreshPath := filepath.Join(home, ".urnetwork", "jwt_last_refresh")
+	const periodicInterval = 7 * 24 * time.Hour
+	const expiryFallbackWindow = 48 * time.Hour
+	jitterMs := time.Duration(mathrand.Intn(10)) * time.Minute
+	select {
+	case <-time.After(jitterMs):
+	case <-ctx.Done():
+		return
+	}
+	readLastRefreshTime := func() time.Time {
+		data, err := os.ReadFile(lastRefreshPath)
+		if err != nil {
+			return time.Time{}
+		}
+		unixSec, err := strconv.ParseInt(strings.TrimSpace(string(data)), 10, 64)
+		if err != nil {
+			return time.Time{}
+		}
+		return time.Unix(unixSec, 0)
+	}
+	writeLastRefreshTime := func(t time.Time) error {
+		return os.WriteFile(lastRefreshPath, []byte(strconv.FormatInt(t.Unix(), 10)), 0700)
+	}
+	ticker := time.NewTicker(1 * time.Hour)
+	defer ticker.Stop()
+	for {
+		byJwtBytes, err := os.ReadFile(jwtPath)
+		if err == nil {
+			byJwt := strings.TrimSpace(string(byJwtBytes))
+			lastRefreshTime := readLastRefreshTime()
+			sinceLastRefresh := time.Since(lastRefreshTime)
+			periodicDue := sinceLastRefresh >= periodicInterval
+			exp := parseJWTExpiryTime(byJwt)
+			expiryDue := exp != nil && time.Until(*exp) <= expiryFallbackWindow
+			if periodicDue || expiryDue {
+				var reason string
+				switch {
+				case periodicDue && expiryDue:
+					reason = fmt.Sprintf("7-day periodic refresh due (last refresh %s ago) and within %s of expiry",
+						formatDuration(sinceLastRefresh), formatDuration(expiryFallbackWindow))
+				case periodicDue:
+					reason = fmt.Sprintf("7-day periodic refresh due (last refresh %s ago)", formatDuration(sinceLastRefresh))
+				default:
+					reason = fmt.Sprintf("expiry fallback triggered (expires in %s, within %s threshold)",
+						formatDuration(time.Until(*exp)), formatDuration(expiryFallbackWindow))
+				}
+				tlog("[jwt] refreshing token — %s\n", reason)
+				newJwt, err := refreshJWT(ctx, apiUrl, byJwt)
+				if err != nil {
+					tlog("[jwt] refresh failed: %v (will retry in 1h)\n", err)
+				} else if err := os.WriteFile(jwtPath, []byte(newJwt), 0700); err != nil {
+					tlog("[jwt] failed to write refreshed token: %v (will retry in 1h)\n", err)
+				} else {
+					now := time.Now()
+					if err := writeLastRefreshTime(now); err != nil {
+						tlog("[jwt] token refreshed but failed to persist last-refresh timestamp: %v\n", err)
+					} else {
+						tlog("[jwt] token refreshed successfully (next periodic refresh in %s)\n", formatDuration(periodicInterval))
+					}
+				}
+			}
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+		}
+	}
+}
+
+func formatDuration(d time.Duration) string {
+	h := int(d.Hours())
+	m := int(d.Minutes()) % 60
+	if h == 0 {
+		return fmt.Sprintf("%dm", m)
+	}
+	return fmt.Sprintf("%dh %dm", h, m)
 }
