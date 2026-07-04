@@ -338,6 +338,18 @@ func runHealthHeartbeat(ctx context.Context, startTime time.Time, profile string
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 
+	// deadConfirmDelay gates confirmed-dead event logging until one pulse cycle has
+	// elapsed, so the startup ramp is not recorded as dead.
+	const deadConfirmDelay = 65 * time.Minute
+
+	// per-proxy byte counts from the previous tick, used to compute rates.
+	prevTick := map[string]trafficBytes{}
+	prevTickTime := time.Now()
+
+	// per-proxy billable byte checkpoint at midnight, to show "today" totals.
+	midnightCheckpoint := map[string]uint64{}
+	nextMidnightReset := nextMidnight(time.Now())
+
 	for {
 		select {
 		case <-ctx.Done():
@@ -345,12 +357,197 @@ func runHealthHeartbeat(ctx context.Context, startTime time.Time, profile string
 		case <-ticker.C:
 		}
 
-		var m runtime.MemStats
-		runtime.ReadMemStats(&m)
-		uptime := time.Since(startTime).Round(time.Second)
-		proxies := connect.ActiveProxyConnections()
-		fmt.Printf("[health] uptime=%s profile=%s heap=%dMiB sys=%dMiB connections=%d\n",
-			uptime, profile, m.HeapAlloc/1024/1024, m.Sys/1024/1024, proxies)
+		samples := []metrics.Sample{
+			{Name: "/memory/classes/heap/objects:bytes"},
+			{Name: "/memory/classes/total:bytes"},
+		}
+		metrics.Read(samples)
+		heapMiB := metricBytesToMiB("/memory/classes/heap/objects:bytes", samples[0].Value)
+		sysMiB := metricBytesToMiB("/memory/classes/total:bytes", samples[1].Value)
+		uptime := time.Since(startTime).Truncate(time.Second)
+		tlog("❤️ [health] uptime=%s profile=%s heap=%dMiB sys=%dMiB goroutines=%d connections=%d proxies=%d\n",
+			uptime, profile, heapMiB, sysMiB, runtime.NumGoroutine(), connect.ActiveConnectionCount(), connect.ActiveProxyConnections())
+
+		if connect.ProxyHealthCount() == 0 {
+			continue // non-proxy mode: no [health][proxies] lines
+		}
+
+		now := time.Now()
+		report := connect.ProxyHealthHeartbeat(uptime >= deadConfirmDelay)
+		down := len(report.Dead) + len(report.Degraded)
+		tlog("❤️ [health][proxies] up=%d down=%d dead=%d degraded=%d recovered=%d lost=%d lifetime_recovered=%d lifetime_lost=%d\n",
+			report.Up, down, len(report.Dead), len(report.Degraded),
+			len(report.Recovered), len(report.NewlyDegraded),
+			report.LifetimeRecovered, report.LifetimeLost)
+		if len(report.Dead) > 0 {
+			tlog("[health][proxies] dead: %s\n", capProxyList(report.Dead, proxyHealthListCap))
+		}
+		if len(report.Degraded) > 0 {
+			tlog("[health][proxies] degraded: %s\n", capProxyList(report.Degraded, proxyHealthListCap))
+		}
+
+		// Reset midnight checkpoints when the day rolls over.
+		if now.After(nextMidnightReset) {
+			for k, bw := range report.Bandwidth {
+				midnightCheckpoint[k] = bw.BillableRx.Load() + bw.BillableTx.Load()
+			}
+			nextMidnightReset = nextMidnight(now)
+		}
+
+		// Compute per-tick rates and emit [traffic] lines.
+		elapsed := now.Sub(prevTickTime).Seconds()
+		if elapsed < 1 {
+			elapsed = 1
+		}
+		var totalRxDelta, totalTxDelta, totalBillable uint64
+		var totalClients int64
+		activeProxies := 0
+		serving := 0
+		for key, bw := range report.Bandwidth {
+			rx := bw.TotalRx.Load()
+			tx := bw.TotalTx.Load()
+			clients := bw.Clients.Load()
+			totalClients += clients
+			if clients > 0 {
+				serving++
+			}
+			prev := prevTick[key]
+			// Guard against counter resets: a proxy goroutine restart / hot-reload
+			// hands back a fresh zeroed ProxyBandwidth, so the current value can be
+			// below the persisted previous one. An unguarded uint64 subtraction would
+			// wrap to ~18 EB and print absurd Tbps rates. Treat a backwards counter as
+			// a fresh baseline with zero delta for this tick.
+			var rxDelta, txDelta uint64
+			if rx >= prev.rx {
+				rxDelta = rx - prev.rx
+			}
+			if tx >= prev.tx {
+				txDelta = tx - prev.tx
+			}
+			totalRxDelta += rxDelta
+			totalTxDelta += txDelta
+			prevTick[key] = trafficBytes{rx: rx, tx: tx}
+
+			if rxDelta == 0 && txDelta == 0 {
+				continue
+			}
+			activeProxies++
+			// Same reset guard for the midnight-anchored "today" total: if the live
+			// counter dropped below the checkpoint (proxy restart), rebase the
+			// checkpoint so billable_today starts from the current value instead of
+			// underflowing. A missing checkpoint defaults to 0 (lifetime == today
+			// until the first midnight rollover), preserving prior behavior.
+			billableTotal := bw.BillableRx.Load() + bw.BillableTx.Load()
+			cp := midnightCheckpoint[key]
+			if billableTotal < cp {
+				cp = billableTotal
+				midnightCheckpoint[key] = billableTotal
+			}
+			billableToday := billableTotal - cp
+			totalBillable += billableToday
+
+			// Only emit a per-proxy line when the proxy is actually carrying client
+			// sessions. Connected-but-idle proxies still move a few bytes per tick
+			// (keepalive), so without this gate every proxy prints a line every tick
+			// (thousands of lines), burying other log output. The total rollup below
+			// still accounts for all proxies, active or idle.
+			if clients == 0 {
+				continue
+			}
+			ageStr := ""
+			if age := bw.MaxAge(); age > 0 {
+				ageStr = fmt.Sprintf(" age=%s", age.Round(time.Second))
+			}
+			tlog("[traffic] %s rx=%s tx=%s clients=%d%s billable_today=%s\n",
+				key,
+				fmtRate(float64(rxDelta)/elapsed),
+				fmtRate(float64(txDelta)/elapsed),
+				clients,
+				ageStr,
+				fmtBytes(billableToday),
+			)
+		}
+		prevTickTime = now
+		earning := "no"
+		if totalBillable > 0 {
+			earning = "yes"
+		}
+		tlog("📈 [traffic] total rx=%s tx=%s clients=%d active_proxies=%d billable_today=%s earning=%s\n",
+			fmtRate(float64(totalRxDelta)/elapsed),
+			fmtRate(float64(totalTxDelta)/elapsed),
+			totalClients,
+			activeProxies,
+			fmtBytes(totalBillable),
+			earning,
+		)
+		// [earn] surfaces utilization: how many up proxies are actually carrying
+		// users (serving) vs sitting idle. Sustained high idle with up>0 means the
+		// platform is not assigning users to this node — an earning signal distinct
+		// from [traffic] (bytes) and [contract] (assignments).
+		idle := report.Up - serving
+		if idle < 0 {
+			idle = 0
+		}
+		tlog("[earn] proxies_up=%d serving=%d idle=%d clients=%d\n",
+			report.Up, serving, idle, totalClients)
+
+		// Pruning must use the full desired address set (file/internal + URL
+		// cache), not just currently-registered health entries: a proxy that
+		// has given up unregisters immediately on exit
+		// (defer connect.UnregisterProxy(...)), so it would otherwise look
+		// "gone" for its entire wait window before the next requeue, wiping
+		// its give-up/failure history every heartbeat tick and defeating the
+		// escalating backoff.
+		keepAddrs, pruneErr := currentDesiredProxyAddresses()
+		if pruneErr != nil {
+			tlog("[proxy] warning: could not determine desired proxy addresses for history pruning: %v\n", pruneErr)
+			keepAddrs = make(map[string]bool, len(report.Bandwidth))
+			for k := range report.Bandwidth {
+				keepAddrs[k] = true
+			}
+		}
+		globalProxyFailureHistory.Prune(keepAddrs)
+		globalProvenProxies.Prune(keepAddrs)
+
+		// Update proxy.state health snapshot for use by proxy refresh subcommand.
+		// proxyStateMu serializes this with reload()'s state write to prevent
+		// resurrection of proxies that were removed between our read and write.
+		// Entries absent from liveHealth are removed (not marked dead) — they are
+		// either deregistered via hot-reload or stale from a prior run.
+		go func() {
+			proxyStateMu.Lock()
+			defer proxyStateMu.Unlock()
+			state, err := readProxyState()
+			if err != nil {
+				return
+			}
+			if state.StartedAt.IsZero() {
+				state.StartedAt = startTime
+			}
+			liveHealth := connect.ProxyHealthByAddress()
+			for addr, entry := range state.Proxies {
+				if h, ok := liveHealth[addr]; ok {
+					entry.Health = h.Health
+					if h.DownSince.IsZero() {
+						entry.DownSince = ""
+					} else {
+						entry.DownSince = h.DownSince.Format(time.RFC3339)
+					}
+					state.Proxies[addr] = entry
+				} else {
+					delete(state.Proxies, addr)
+				}
+			}
+			if err := writeProxyState(state); err != nil {
+				tlog("[proxy] warn: state write failed: %v\n", err)
+			}
+		}()
+
+		if dir, ok := proxyHealthDir(); ok {
+			writeProxyHealthState(dir, report, now)
+			writeProxyHealthEvents(dir, report, now)
+			writeProxyTrafficState(dir, report, now)
+		}
 	}
 }
 
