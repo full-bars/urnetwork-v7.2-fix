@@ -1,0 +1,114 @@
+name: Release Binaries
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: Build Binaries
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        goos: [linux]
+        goarch: [amd64, arm64]
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.26'
+
+      - name: Cache Go module download
+        uses: actions/cache@v4
+        with:
+          path: ~/go/pkg/mod
+          key: ${{ runner.os }}-gomod-${{ hashFiles('go.sum') }}
+          restore-keys: |
+            ${{ runner.os }}-gomod-
+
+      - name: Cache Go build cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/go-build
+          key: ${{ runner.os }}-gobuild-${{ matrix.goos }}-${{ matrix.goarch }}-${{ hashFiles('go.sum') }}
+          restore-keys: |
+            ${{ runner.os }}-gobuild-
+
+      - name: Build provider
+        run: |
+          VERSION=${GITHUB_REF_NAME:-v7.2.0-fix.1}
+          GOOS=${{ matrix.goos }} GOARCH=${{ matrix.goarch }} CGO_ENABLED=0 \
+          go build -trimpath \
+          -ldflags "-s -w -X main.Version=${VERSION}" \
+          -o bin/${{ matrix.goos }}/${{ matrix.goarch }}/provider ./provider/
+
+      - name: Upload provider artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: provider-${{ matrix.goarch }}
+          path: bin/${{ matrix.goos }}/${{ matrix.goarch }}/provider
+
+  create-release:
+    name: Create Release
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6
+
+      - name: Download provider amd64 artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: provider-amd64
+          path: release_tmp/linux/amd64/
+
+      - name: Download provider arm64 artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: provider-arm64
+          path: release_tmp/linux/arm64/
+
+      - name: Prepare binaries
+        run: |
+          VERSION=${GITHUB_REF_NAME:-latest}
+          find release_tmp -name "provider*" -type f -exec chmod +x {} \;
+          mv release_tmp/linux/amd64/provider-amd64 release_tmp/linux/amd64/provider 2>/dev/null || true
+          mv release_tmp/linux/arm64/provider-arm64 release_tmp/linux/arm64/provider 2>/dev/null || true
+
+      - name: Create provider tarball
+        run: |
+          VERSION=${GITHUB_REF_NAME:-latest}
+          cp scripts/Provider_Install_Linux.sh release_tmp/urnet-tools
+          cd release_tmp
+          tar -czf ../urnetwork-provider-${VERSION}.tar.gz linux/ urnet-tools
+          cd ..
+
+      - name: Set release body source
+        id: body_src
+        run: |
+          CUSTOM="releases/${GITHUB_REF_NAME}.md"
+          if [ -f "$CUSTOM" ]; then
+            echo "path=${CUSTOM}" >> "$GITHUB_OUTPUT"
+            echo "auto=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "path=" >> "$GITHUB_OUTPUT"
+            echo "auto=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Release
+        uses: softprops/action-gh-release@v2
+        if: startsWith(github.ref, 'refs/tags/')
+        with:
+          files: |
+            urnetwork-provider-*.tar.gz
+          draft: false
+          prerelease: ${{ contains(github.ref, '-rc') || contains(github.ref, '-alpha') || contains(github.ref, '-beta') }}
+          body_path: ${{ steps.body_src.outputs.path }}
+          generate_release_notes: ${{ steps.body_src.outputs.auto }}
