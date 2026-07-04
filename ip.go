@@ -2975,6 +2975,7 @@ type RemoteUserNatProvider struct {
 	cancel            context.CancelFunc
 	localUserNat      *LocalUserNat
 	securityPolicy    SecurityPolicy
+	bw                *ProxyBandwidth
 	settings          *RemoteUserNatProviderSettings
 	localUserNatUnsub func()
 	clientUnsub       func()
@@ -2990,23 +2991,24 @@ type RemoteUserNatProvider struct {
 func NewRemoteUserNatProviderWithDefaults(
 	client *Client,
 	localUserNat *LocalUserNat,
+	bw *ProxyBandwidth,
 ) *RemoteUserNatProvider {
-	return NewRemoteUserNatProvider(client, localUserNat, DefaultRemoteUserNatProviderSettings())
+	return NewRemoteUserNatProvider(client, localUserNat, bw, DefaultRemoteUserNatProviderSettings())
 }
 
 func NewRemoteUserNatProvider(
 	client *Client,
 	localUserNat *LocalUserNat,
+	bw *ProxyBandwidth,
 	settings *RemoteUserNatProviderSettings,
 ) *RemoteUserNatProvider {
-	// the security policy runs a background scan goroutine; scope it to this provider (a child of
-	// the client ctx) so Close stops it, rather than leaking it for the life of the client
 	cancelCtx, cancel := context.WithCancel(client.Ctx())
 	userNatProvider := &RemoteUserNatProvider{
 		client:            client,
 		cancel:            cancel,
 		localUserNat:      localUserNat,
 		securityPolicy:    settings.SecurityPolicyGenerator(cancelCtx, DefaultSecurityPolicyStatsCollector()),
+		bw:                bw,
 		settings:          settings,
 		sourceProvideMode: map[Id]protocol.ProvideMode{},
 	}

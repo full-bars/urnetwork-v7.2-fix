@@ -563,8 +563,17 @@ func provide(opts docopt.Opts) {
 
 		localUserNat := connect.NewLocalUserNat(proxyCtx, clientId.String(), localUserNatSettings)
 		defer localUserNat.Close()
-		remoteUserNatProvider := connect.NewRemoteUserNatProvider(connectClient, localUserNat, remoteUserNatProviderSettings)
+
+		var bw *connect.ProxyBandwidth
+		if proxySettings != nil {
+			bw = connect.RegisterProxyBandwidth(proxySettings.Index)
+		}
+		remoteUserNatProvider := connect.NewRemoteUserNatProvider(connectClient, localUserNat, bw, remoteUserNatProviderSettings)
 		defer remoteUserNatProvider.Close()
+
+		if proxySettings != nil && bw != nil {
+			startProxyBenchmarks(proxyCtx, bw, proxySettings)
+		}
 
 		provideModes := map[protocol.ProvideMode]bool{
 			protocol.ProvideMode_Public:  true,
@@ -824,6 +833,112 @@ func runEcoMemoryMonitor(ctx context.Context) {
 			}
 		}
 	}
+}
+
+func startEcoMonitorOnce(ctx context.Context) {
+	if ecoMonitorStarted.CompareAndSwap(false, true) {
+		startEcoMonitor(ctx)
+	}
+}
+
+func earningReason(earning bool, proxiesUp int, clients int64, warmup bool) string {
+	switch {
+	case earning:
+		return "-"
+	case warmup:
+		return "warmup"
+	case proxiesUp == 0:
+		return "no_proxies"
+	case clients == 0:
+		return "idle"
+	default:
+		return "no_traffic"
+	}
+}
+
+func proxyAuthRetryDelay(err error, attempt int) time.Duration {
+	if isRateLimitedError(err) {
+		delay := time.Duration(attempt)*5*time.Second + time.Duration(mathrand.Intn(5000))*time.Millisecond
+		if delay > 60*time.Second {
+			delay = 60 * time.Second
+		}
+		return delay
+	}
+	delay := time.Duration(500+mathrand.Intn(3000)) * time.Millisecond
+	if attempt > 1 {
+		delay += time.Duration(attempt-1) * time.Second
+	}
+	if delay > 15*time.Second {
+		delay = 15 * time.Second
+	}
+	return delay
+}
+
+func classifyAuthFailureCause(err error) string {
+	errMsg := err.Error()
+	switch {
+	case strings.Contains(errMsg, "proxy unreachable"):
+		return "proxy itself is unreachable (dead/offline SOCKS endpoint — not an API issue)"
+	case errors.Is(err, context.DeadlineExceeded),
+		errors.Is(err, context.Canceled),
+		strings.Contains(errMsg, "Timeout"),
+		strings.Contains(errMsg, "timeout"),
+		strings.Contains(errMsg, "deadline exceeded"),
+		strings.Contains(errMsg, "connection refused"),
+		strings.Contains(errMsg, "no such host"):
+		return "network error reaching API (check connectivity to api.bringyour.com)"
+	default:
+		return "API rejected token (check JWT validity)"
+	}
+}
+
+func proxyAuthSlowRetryDelay(slowAttempt int) time.Duration {
+	if slowAttempt < 1 {
+		slowAttempt = 1
+	}
+	base := time.Duration(slowAttempt) * 5 * time.Minute
+	if base > 15*time.Minute {
+		base = 15 * time.Minute
+	}
+	return base + time.Duration(mathrand.Intn(30000))*time.Millisecond
+}
+
+const (
+	proxyURLGiveUpRetryBase = 15 * time.Minute
+	proxyURLGiveUpRetryCap  = 24 * time.Hour
+	proxyURLGiveUpEvictAfterCycles = 10
+)
+
+func proxyURLGiveUpRetryDelay(giveUpCount int) time.Duration {
+	if giveUpCount < 1 {
+		giveUpCount = 1
+	}
+	delay := proxyURLGiveUpRetryBase
+	for i := 1; i < giveUpCount; i++ {
+		delay *= 2
+		if delay >= proxyURLGiveUpRetryCap {
+			delay = proxyURLGiveUpRetryCap
+			break
+		}
+	}
+	jitter := time.Duration(mathrand.Int63n(int64(delay)/5 + 1))
+	return delay + jitter
+}
+
+func readSHMLog(path string, n int) (string, error) {
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return "", err
+	}
+	if n <= 0 {
+		return string(b), nil
+	}
+	s := strings.TrimRight(string(b), "\n")
+	lines := strings.Split(s, "\n")
+	if n > len(lines) {
+		n = len(lines)
+	}
+	return strings.Join(lines[len(lines)-n:], "\n") + "\n", nil
 }
 
 func applyPoolAutoSize(maxMemory connect.ByteCount) {
@@ -1366,6 +1481,12 @@ func writeProxyConfig(proxyConfig *ProxyConfig) {
 	err = os.WriteFile(proxyPath, b, 0700)
 	if err != nil {
 		panic(err)
+	}
+
+	if reloadPath, err := proxyReloadPath(); err == nil {
+		if err := writeReloadTrigger(reloadPath); err != nil {
+			tlog("[proxy] warn: reload trigger write failed: %v\n", err)
+		}
 	}
 }
 

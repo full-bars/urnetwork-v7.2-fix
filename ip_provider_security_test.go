@@ -45,7 +45,7 @@ func TestRemoteUserNatProviderEnforcesReversedPolicy(t *testing.T) {
 		}
 	})
 
-	provider := NewRemoteUserNatProvider(providerClient, localUserNat, DefaultRemoteUserNatProviderSettings())
+	provider := NewRemoteUserNatProvider(providerClient, localUserNat, nil, DefaultRemoteUserNatProviderSettings())
 	defer provider.Close()
 
 	source := SourceId(NewId())

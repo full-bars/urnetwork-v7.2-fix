@@ -205,7 +205,7 @@ func TestUpgradeMuxDefaultDnsThroughTunnel(t *testing.T) {
 	providerLocalUserNat := NewLocalUserNatWithDefaults(ctx, "test-exit")
 	providerNatSettings := DefaultRemoteUserNatProviderSettings()
 	providerNatSettings.SecurityPolicyGenerator = DisableSecurityPolicyWithStats
-	provider := NewRemoteUserNatProvider(providerClient, providerLocalUserNat, providerNatSettings)
+	provider := NewRemoteUserNatProvider(providerClient, providerLocalUserNat, nil, providerNatSettings)
 	defer provider.Close()
 
 	// local DoH server (reachable on the host loopback via the provider's LocalUserNat)
