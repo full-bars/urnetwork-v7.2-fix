@@ -16,6 +16,8 @@ import (
 	"regexp"
 	"runtime"
 	"runtime/debug"
+	"runtime/metrics"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -57,6 +59,19 @@ func validateJWTExpiry(byJwt string) error {
 var provideStartTime time.Time
 
 var proxyWarmupDone atomic.Bool
+
+type ecoState int
+
+const (
+	ecoStateNormal ecoState = iota
+	ecoStatePressure
+	ecoStateCritical
+)
+
+var (
+	ecoMonitorStarted atomic.Bool
+	startEcoMonitor   = func(ctx context.Context) { go runEcoMemoryMonitor(ctx) }
+)
 
 func init() {
 	// debug.SetGCPercent(10)
@@ -397,6 +412,7 @@ func provide(opts docopt.Opts) {
 
 	go runOutageWatcher(ctx, os.Getenv("URNETWORK_NODE_NAME"), os.Getenv("URNETWORK_ALERT_WEBHOOK"))
 	go runHealthHeartbeat(ctx, provideStartTime, os.Getenv("URNETWORK_PROFILE"))
+	go runJWTRefresher(ctx, apiUrl)
 
 	provideWithProxy := func(proxySettings *connect.ProxySettings) {
 		proxyCtx, proxyCancel := context.WithCancel(ctx)
@@ -649,6 +665,165 @@ func backoffPacer(n int, staggerMs int, now time.Time, proxyCtx context.Context)
 	case <-time.After(wait):
 	}
 	return true
+}
+
+func applyTurboSettings(clientSettings *connect.ClientSettings, localUserNatSettings *connect.LocalUserNatSettings) {
+	profile := os.Getenv("URNETWORK_PROFILE")
+	var windowSize uint32
+	var queueBytes connect.ByteCount
+	switch profile {
+	case "turbo-v4":
+		windowSize = 4 * 1024 * 1024
+		queueBytes = 8 * 1024 * 1024
+	case "turbo-v8":
+		windowSize = 8 * 1024 * 1024
+		queueBytes = 16 * 1024 * 1024
+	default:
+		return
+	}
+
+	localUserNatSettings.TcpBufferSettings.MaxWindowSize = windowSize
+	localUserNatSettings.UdpBufferSettings.MaxWindowSize = windowSize
+	localUserNatSettings.SequenceBufferSize = 512
+	localUserNatSettings.TcpBufferSettings.SequenceBufferSize = 512
+	localUserNatSettings.UdpBufferSettings.SequenceBufferSize = 512
+	clientSettings.SendBufferSettings.ResendQueueMaxByteCount = queueBytes
+	clientSettings.ReceiveBufferSettings.ReceiveQueueMaxByteCount = queueBytes
+	clientSettings.SendBufferSettings.SequenceBufferSize = 64
+	clientSettings.ReceiveBufferSettings.SequenceBufferSize = 64
+	clientSettings.WebRtcSettings.ReceiveBufferSize = connect.ByteCount(windowSize) * 2
+	clientSettings.ContractManagerSettings.ContractTransferByteSeqScale = 2
+	if os.Getenv("GOGC") == "" {
+		debug.SetGCPercent(200)
+	}
+}
+
+func applyEcoSettings(maxMemory connect.ByteCount) {
+	if os.Getenv("URNETWORK_PROFILE") != "eco" {
+		return
+	}
+	if os.Getenv("GOGC") == "" {
+		debug.SetGCPercent(50)
+	}
+	if os.Getenv("GOMEMLIMIT") == "" && maxMemory == 0 {
+		ramBytes := connect.DetectEffectiveRAMLimitBytes()
+		ecoLimit := ramBytes * 75 / 100
+		debug.SetMemoryLimit(ecoLimit)
+	}
+}
+
+func readMemAvailableMiB() int64 {
+	f, err := os.Open("/proc/meminfo")
+	if err != nil {
+		return -1
+	}
+	defer f.Close()
+	scanner := bufio.NewScanner(f)
+	for scanner.Scan() {
+		line := scanner.Text()
+		if strings.HasPrefix(line, "MemAvailable:") {
+			fields := strings.Fields(line)
+			if len(fields) >= 2 {
+				if v, err := strconv.ParseInt(fields[1], 10, 64); err == nil {
+					return v / 1024
+				}
+			}
+		}
+	}
+	return -1
+}
+
+func readCgroupAvailableMiB() int64 {
+	const oneTiB = int64(1) << 40
+	maxData, maxErr := os.ReadFile("/sys/fs/cgroup/memory.max")
+	currData, currErr := os.ReadFile("/sys/fs/cgroup/memory.current")
+	if maxErr == nil && currErr == nil {
+		maxStr := strings.TrimSpace(string(maxData))
+		if maxStr != "max" {
+			limit, err1 := strconv.ParseInt(maxStr, 10, 64)
+			curr, err2 := strconv.ParseInt(strings.TrimSpace(string(currData)), 10, 64)
+			if err1 == nil && err2 == nil && limit > 0 && limit < oneTiB {
+				if avail := (limit - curr) / 1024 / 1024; avail >= 0 {
+					return avail
+				}
+				return 0
+			}
+		}
+	}
+	limitData, limitErr := os.ReadFile("/sys/fs/cgroup/memory/memory.limit_in_bytes")
+	usageData, usageErr := os.ReadFile("/sys/fs/cgroup/memory/memory.usage_in_bytes")
+	if limitErr == nil && usageErr == nil {
+		limit, err1 := strconv.ParseInt(strings.TrimSpace(string(limitData)), 10, 64)
+		usage, err2 := strconv.ParseInt(strings.TrimSpace(string(usageData)), 10, 64)
+		if err1 == nil && err2 == nil && limit > 0 && limit < oneTiB {
+			if avail := (limit - usage) / 1024 / 1024; avail >= 0 {
+				return avail
+			}
+			return 0
+		}
+	}
+	return -1
+}
+
+func runEcoMemoryMonitor(ctx context.Context) {
+	const (
+		criticalMiB int64 = 150
+		pressureMiB int64 = 300
+		recoveryMiB int64 = 450
+		gcNormal           = 50
+		gcPressure         = 25
+		gcCritical         = 10
+	)
+	state := ecoStateNormal
+	ticker := time.NewTicker(30 * time.Second)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			avail := readMemAvailableMiB()
+			if avail < 0 {
+				continue
+			}
+			if cgroupAvail := readCgroupAvailableMiB(); cgroupAvail >= 0 && cgroupAvail < avail {
+				avail = cgroupAvail
+			}
+			var next ecoState
+			switch {
+			case avail <= criticalMiB:
+				next = ecoStateCritical
+			case avail <= pressureMiB:
+				next = ecoStatePressure
+			case avail >= recoveryMiB:
+				next = ecoStateNormal
+			default:
+				if state == ecoStateCritical {
+					runtime.GC()
+				}
+				continue
+			}
+			if next == state {
+				if state == ecoStateCritical {
+					runtime.GC()
+				}
+				continue
+			}
+			state = next
+			switch state {
+			case ecoStateNormal:
+				debug.SetGCPercent(gcNormal)
+				tlog("[eco] memory pressure eased (available=%dMiB), GOGC=%d\n", avail, gcNormal)
+			case ecoStatePressure:
+				debug.SetGCPercent(gcPressure)
+				tlog("[eco] memory pressure (available=%dMiB, GOGC=%d → %d)\n", avail, gcNormal, gcPressure)
+			case ecoStateCritical:
+				runtime.GC()
+				debug.SetGCPercent(gcCritical)
+				tlog("[eco] memory critical (available=%dMiB, GOGC=%d → %d, forcing GC)\n", avail, gcNormal, gcCritical)
+			}
+		}
+	}
 }
 
 func applyPoolAutoSize(maxMemory connect.ByteCount) {
@@ -1191,6 +1366,150 @@ func writeProxyConfig(proxyConfig *ProxyConfig) {
 	err = os.WriteFile(proxyPath, b, 0700)
 	if err != nil {
 		panic(err)
+	}
+}
+
+func parseJWTExpiryTime(byJwt string) *time.Time {
+	parser := gojwt.NewParser()
+	tok, _, err := parser.ParseUnverified(byJwt, gojwt.MapClaims{})
+	if err != nil {
+		return nil
+	}
+	claims, ok := tok.Claims.(gojwt.MapClaims)
+	if !ok {
+		return nil
+	}
+	exp, ok := claims["exp"].(float64)
+	if !ok {
+		return nil
+	}
+	t := time.Unix(int64(exp), 0)
+	return &t
+}
+
+func refreshJWT(ctx context.Context, apiUrl, byJwt string) (string, error) {
+	clientStrategy := connect.NewClientStrategyWithDefaults(ctx)
+	api := connect.NewBringYourApi(ctx, clientStrategy, apiUrl)
+	api.SetByJwt(byJwt)
+	callback, channel := connect.NewBlockingApiCallback[*connect.AuthNetworkClientResult](ctx)
+	api.AuthNetworkClient(&connect.AuthNetworkClientArgs{
+		Description: "jwt-refresh",
+		DeviceSpec:  "",
+	}, callback)
+	var result connect.ApiCallbackResult[*connect.AuthNetworkClientResult]
+	select {
+	case <-ctx.Done():
+		return "", ctx.Err()
+	case result = <-channel:
+	}
+	if result.Error != nil {
+		return "", fmt.Errorf("api error: %w", result.Error)
+	}
+	if result.Result == nil {
+		return "", fmt.Errorf("empty result from auth API")
+	}
+	if result.Result.Error != nil {
+		return "", fmt.Errorf("auth rejected: %s", result.Result.Error.Message)
+	}
+	if result.Result.ByClientJwt == "" {
+		return "", fmt.Errorf("empty ByClientJwt in response")
+	}
+	return result.Result.ByClientJwt, nil
+}
+
+func runJWTRefresher(ctx context.Context, apiUrl string) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return
+	}
+	jwtPath := filepath.Join(home, ".urnetwork", "jwt")
+	lastRefreshPath := filepath.Join(home, ".urnetwork", "jwt_last_refresh")
+	const periodicInterval = 7 * 24 * time.Hour
+	const expiryFallbackWindow = 48 * time.Hour
+	jitterMs := time.Duration(mathrand.Intn(10)) * time.Minute
+	select {
+	case <-time.After(jitterMs):
+	case <-ctx.Done():
+		return
+	}
+	readLastRefreshTime := func() time.Time {
+		data, err := os.ReadFile(lastRefreshPath)
+		if err != nil {
+			return time.Time{}
+		}
+		unixSec, err := strconv.ParseInt(strings.TrimSpace(string(data)), 10, 64)
+		if err != nil {
+			return time.Time{}
+		}
+		return time.Unix(unixSec, 0)
+	}
+	writeLastRefreshTime := func(t time.Time) error {
+		return os.WriteFile(lastRefreshPath, []byte(strconv.FormatInt(t.Unix(), 10)), 0700)
+	}
+	ticker := time.NewTicker(1 * time.Hour)
+	defer ticker.Stop()
+	for {
+		byJwtBytes, err := os.ReadFile(jwtPath)
+		if err == nil {
+			byJwt := strings.TrimSpace(string(byJwtBytes))
+			lastRefreshTime := readLastRefreshTime()
+			sinceLastRefresh := time.Since(lastRefreshTime)
+			periodicDue := sinceLastRefresh >= periodicInterval
+			exp := parseJWTExpiryTime(byJwt)
+			expiryDue := exp != nil && time.Until(*exp) <= expiryFallbackWindow
+			if periodicDue || expiryDue {
+				var reason string
+				switch {
+				case periodicDue && expiryDue:
+					reason = fmt.Sprintf("7-day periodic refresh due (last refresh %s ago) and within %s of expiry",
+						formatDuration(sinceLastRefresh), formatDuration(expiryFallbackWindow))
+				case periodicDue:
+					reason = fmt.Sprintf("7-day periodic refresh due (last refresh %s ago)", formatDuration(sinceLastRefresh))
+				default:
+					reason = fmt.Sprintf("expiry fallback triggered (expires in %s, within %s threshold)",
+						formatDuration(time.Until(*exp)), formatDuration(expiryFallbackWindow))
+				}
+				tlog("[jwt] refreshing token — %s\n", reason)
+				newJwt, err := refreshJWT(ctx, apiUrl, byJwt)
+				if err != nil {
+					tlog("[jwt] refresh failed: %v (will retry in 1h)\n", err)
+				} else if err := os.WriteFile(jwtPath, []byte(newJwt), 0700); err != nil {
+					tlog("[jwt] failed to write refreshed token: %v (will retry in 1h)\n", err)
+				} else {
+					now := time.Now()
+					if err := writeLastRefreshTime(now); err != nil {
+						tlog("[jwt] token refreshed but failed to persist last-refresh timestamp: %v\n", err)
+					} else {
+						tlog("[jwt] token refreshed successfully (next periodic refresh in %s)\n", formatDuration(periodicInterval))
+					}
+				}
+			}
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+		}
+	}
+}
+
+func formatDuration(d time.Duration) string {
+	h := int(d.Hours())
+	m := int(d.Minutes()) % 60
+	if h == 0 {
+		return fmt.Sprintf("%dm", m)
+	}
+	return fmt.Sprintf("%dh %dm", h, m)
+}
+
+func metricBytesToMiB(name string, v metrics.Value) uint64 {
+	switch v.Kind() {
+	case metrics.KindUint64:
+		return v.Uint64() / 1024 / 1024
+	case metrics.KindFloat64:
+		return uint64(v.Float64()) / 1024 / 1024
+	default:
+		return 0
 	}
 }
 
