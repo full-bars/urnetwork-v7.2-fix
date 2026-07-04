@@ -84,7 +84,7 @@ func DefaultClientSettingsWithBufferSize(bufferSize int) *ClientSettings {
 		ForwardBufferSize:       bufferSize,
 		ReadTimeout:             30 * time.Second,
 		BufferTimeout:           15 * time.Second,
-		ControlPingTimeout:      time.Duration(0),
+		ControlPingTimeout:      30 * time.Second,
 		SendBufferSettings:      DefaultSendBufferSettingsWithBufferSize(bufferSize),
 		ReceiveBufferSettings:   DefaultReceiveBufferSettingsWithBufferSize(bufferSize),
 		ForwardBufferSettings:   DefaultForwardBufferSettingsWithBufferSize(bufferSize),
@@ -136,7 +136,7 @@ func DefaultSendBufferSettingsWithBufferSize(bufferSize int) *SendBufferSettings
 		MinMessageByteCount: ByteCount(1),
 		// this includes transport reconnections
 		WriteTimeout:            15 * time.Second,
-		ResendQueueMaxByteCount: mib(2),
+		ResendQueueMaxByteCount: mib(4),
 		ContractFillFraction:    0.8,
 		ProtocolVersion:         DefaultProtocolVersion,
 	}

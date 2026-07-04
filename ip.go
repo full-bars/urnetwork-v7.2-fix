@@ -78,7 +78,7 @@ func DefaultUdpBufferSettingsWithBufferSize(bufferSize int) *UdpBufferSettings {
 		SequenceBufferSize:  bufferSize,
 		WriteBatchSize:      64,
 		UserLimit:           0,
-		MaxWindowSize:       uint32(mib(1)),
+		MaxWindowSize:       uint32(mib(4)),
 		ConnectSettings:     *DefaultConnectSettings(),
 	}
 }
@@ -100,7 +100,7 @@ func DefaultTcpBufferSettingsWithBufferSize(bufferSize int) *TcpBufferSettings {
 		ReadBufferByteCount: int(kib(64)),
 		WriteBatchSize:      64,
 		MinWindowSize:       uint32(kib(64)),
-		MaxWindowSize:       uint32(mib(1)),
+		MaxWindowSize:       uint32(mib(4)),
 		UserLimit:           0,
 		ConnectSettings:     *DefaultConnectSettings(),
 	}
