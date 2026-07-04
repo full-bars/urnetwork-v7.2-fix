@@ -105,6 +105,32 @@ func initGlog() {
 }
 
 func main() {
+	profile := os.Getenv("URNETWORK_PROFILE")
+	ramlogs := os.Getenv("URNETWORK_RAMLOGS")
+
+	// If in auto mode and RAM logs aren't already explicitly on, we audit the disk speed
+	// BEFORE initializing the logger. This allows us to auto-enable it.
+	autoRamLogTriggered := false
+	if profile == "auto" {
+		manualRamLogs := (ramlogs == "1")
+		slowDisk, _ := RunStartupAudit()
+		if slowDisk && !manualRamLogs {
+			tlog("[audit] Disk speed is suboptimal. Auto-enabling RAM logs for performance.\n")
+			os.Setenv("URNETWORK_RAMLOGS", "1")
+			autoRamLogTriggered = true
+		}
+	} else if len(os.Args) > 1 && (os.Args[1] == "provide" || os.Args[1] == "auth-provide") {
+		// Even if not in auto, run audit for visibility
+		RunStartupAudit()
+	}
+
+	initGlog()
+
+	// If auto-tuner enabled RAM logs, perform the countdown handover now
+	if autoRamLogTriggered {
+		initSHMLoggerWithHandover()
+	}
+
 	usage := fmt.Sprintf(
 		`Connect provider.
 
@@ -121,6 +147,12 @@ Usage:
         [--api_url=<api_url>]
         [--connect_url=<connect_url>]
         [--max-memory=<mem>]
+        [--proxy_file=<proxy_file>]
+        [--proxy_url=<proxy_url>...]
+        [--proxy_url_refresh=<proxy_url_refresh>]
+        [--proxy_url_max=<proxy_url_max>]
+        [--proxy_dead_cleanup_scope=<proxy_dead_cleanup_scope>]
+        [--proxy_dead_cleanup_interval=<proxy_dead_cleanup_interval>]
         [-v...]
     provider auth-provide ([<auth_code>] | --user_auth=<user_auth> [--password=<password>]) [-f]
     	[--port=<port>]
@@ -132,7 +164,16 @@ Usage:
     provider proxy auth remove [<key>] [--all]
     provider proxy add [<key_address>...] [--proxy_file=<proxy_file>] [-f]
     provider proxy remove [<key_address>...] [--all]
-    
+    provider proxy remove --match=<pattern> [--yes] [--preview]
+    provider proxy remove-dead [--degraded[=<duration>]] [--source=<source>] [--yes] [--preview]
+    provider proxy activity
+    provider proxy refresh [--force]
+    provider proxy add-source <url>
+    provider proxy remove-source <url>
+    provider proxy exclude [<pattern>] [--remove]
+    provider proxy summary
+    provider logs [-n <lines>]
+
 Options:
     -h --help                        Show this help and exit.
     --version                        Show version.
@@ -151,15 +192,41 @@ Options:
     <proxy_user>                     SOCKS5 user
     <proxy_password>                 SOCKS5 password
     <key_address>                    SOCKS5 server as host:port, host:port:user:pass, host:port::, or key@host:port
-    --proxy_file=<proxy_file>        A path to a file where each line contains on entry as host:port, host:port:user:pass, host:port::, or key@host:port`,
+    --proxy_file=<proxy_file>        A path to a file where each line contains on entry as host:port, host:port:user:pass, host:port::, or key@host:port
+    --proxy_url=<proxy_url>          A live proxy list URL. Repeatable. Additive with --proxy_file / internal config. Also settable via PROXY_URL (comma-separated for multiple).
+    --proxy_url_refresh=<dur>        How often to re-fetch --proxy_url sources and add new entries. Also settable via PROXY_URL_REFRESH.
+    --proxy_url_max=<n>              Cap on total proxies sourced from --proxy_url. 0 = unlimited. Also settable via PROXY_URL_MAX.
+    --proxy_dead_cleanup_scope=<s>   Automatic daily dead-proxy cleanup scope: none, url, or all. Also settable via PROXY_DEAD_CLEANUP_SCOPE.
+    --proxy_dead_cleanup_interval=<dur>  How often automatic cleanup runs, when scope isn't none. Also settable via PROXY_DEAD_CLEANUP_INTERVAL.
+    <url>                            A proxy list URL.
+    --match=<pattern>                Case-insensitive substring matched against proxy hosts (never port or
+                                     credentials). Removes matches from the proxy list, proxy file, and URL
+                                     cache, and excludes the pattern from future URL fetches. See 'proxy exclude'.
+    <pattern>                        Host substring for 'proxy exclude' (add). With --remove, deletes the pattern.
+                                     With no pattern, 'proxy exclude' lists active patterns.
+    --force                          Bypass the 8-hour warmup protection gate.
+    -n <lines>                       Number of lines to show from the end of the log [default: 0].`,
 		DefaultApiUrl,
 		DefaultConnectUrl,
 	)
+
+	// Allow `provider help` as a friendlier alias for --help
+	if len(os.Args) == 2 && os.Args[1] == "help" {
+		os.Args[1] = "--help"
+	}
 
 	opts, err := docopt.ParseArgs(usage, os.Args[1:], RequireVersion())
 
 	if err != nil {
 		panic(err)
+	}
+
+	// Support auth code via environment variable for Docker/dash-prefixed tokens.
+	// An explicit CLI positional argument takes precedence over the env var.
+	if cur, _ := opts.String("<auth_code>"); cur == "" {
+		if envAuthCode := os.Getenv("URNETWORK_AUTH_CODE"); envAuthCode != "" {
+			opts["<auth_code>"] = envAuthCode
+		}
 	}
 
 	if proxy, _ := opts.Bool("proxy"); proxy {
@@ -169,10 +236,24 @@ Options:
 			} else if remove, _ := opts.Bool("remove"); remove {
 				proxyAuthRemove(opts)
 			}
+		} else if addSource, _ := opts.Bool("add-source"); addSource {
+			proxyAddSource(opts)
+		} else if removeSource, _ := opts.Bool("remove-source"); removeSource {
+			proxyRemoveSource(opts)
+		} else if exclude, _ := opts.Bool("exclude"); exclude {
+			proxyExclude(opts)
 		} else if add, _ := opts.Bool("add"); add {
 			proxyAdd(opts)
+		} else if removeDead, _ := opts.Bool("remove-dead"); removeDead {
+			proxyRemoveDead(opts)
 		} else if remove, _ := opts.Bool("remove"); remove {
 			proxyRemove(opts)
+		} else if refresh, _ := opts.Bool("refresh"); refresh {
+			proxyRefresh(opts)
+		} else if activity, _ := opts.Bool("activity"); activity {
+			proxyActivity()
+		} else if summary, _ := opts.Bool("summary"); summary {
+			proxySummary()
 		}
 	} else if auth_, _ := opts.Bool("auth"); auth_ {
 		auth(opts)
@@ -181,8 +262,12 @@ Options:
 	} else if authProvide, _ := opts.Bool("auth-provide"); authProvide {
 		auth(opts)
 		provide(opts)
+	} else if logs, _ := opts.Bool("logs"); logs {
+		providerLogs(opts)
 	}
 }
+
+
 
 func auth(opts docopt.Opts) {
 	home, err := os.UserHomeDir()
