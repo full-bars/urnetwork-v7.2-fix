@@ -365,11 +365,34 @@ func provide(opts docopt.Opts) {
 		}
 
 		byClientJwt, clientId, err := func() (string, connect.Id, error) {
+			authFailures := 0
 			for {
+				admitFailureCount := 0
+				if proxySettings != nil {
+					admitFailureCount = globalProxyFailureHistory.FailureCount(proxySettings.Address)
+				}
+				release, waitErr := globalProxyAdmissionGate.Admit(proxyCtx, admitFailureCount)
+				if waitErr != nil {
+					return "", connect.Id{}, waitErr
+				}
 				byClientJwt, clientId, err := provideAuth(proxyCtx, clientStrategy, apiUrl, opts)
+				if proxySettings != nil {
+					if err == nil {
+						globalProvenProxies.MarkSucceeded(proxySettings.Address)
+						globalProxyFailureHistory.Reset(proxySettings.Address)
+					}
+					globalAuthRateLimiter.ReportResultForProxy(err, globalProvenProxies.HasSucceeded(proxySettings.Address))
+				} else {
+					globalAuthRateLimiter.ReportResult(err)
+				}
+				release()
 				if err == nil {
 					return byClientJwt, clientId, nil
 				}
+				if proxySettings != nil {
+					globalProxyFailureHistory.RecordFailure(proxySettings.Address)
+				}
+				authFailures++
 				retryDelay := time.Duration(500+mathrand.Intn(10000)) * time.Millisecond
 				fmt.Printf("init proxy auth failed. Will retry in %.2fs\n", float64(retryDelay/time.Millisecond)/1000.0)
 				select {
