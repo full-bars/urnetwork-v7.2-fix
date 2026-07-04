@@ -102,6 +102,12 @@ func initGlog() {
 	flag.Set("v", "0")
 	// unlike unix, the android/ios standard is for diagnostics to go to stdout
 	os.Stderr = os.Stdout
+
+	profile := os.Getenv("URNETWORK_PROFILE")
+	ramlogs := os.Getenv("URNETWORK_RAMLOGS") == "1"
+	if profile == "lowmem" || profile == "eco" || ramlogs {
+		initSHMLogger()
+	}
 }
 
 func main() {
