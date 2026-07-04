@@ -10,7 +10,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
-	// "net"
+	"net"
 	mathrand "math/rand"
 	"net/http"
 	"os"
@@ -1335,6 +1335,7 @@ func provideAuth(ctx context.Context, clientStrategy *connect.ClientStrategy, ap
 	}
 	byJwt := strings.TrimSpace(string(byJwtBytes))
 
+	// Layer 1: local pre-validation — avoids a network round-trip for an already-expired token.
 	if err := validateJWTExpiry(byJwt); err != nil {
 		returnErr = err
 		return
@@ -1346,8 +1347,51 @@ func provideAuth(ctx context.Context, clientStrategy *connect.ClientStrategy, ap
 
 	authClientCallback, authClientChannel := connect.NewBlockingApiCallback[*connect.AuthNetworkClientResult](ctx)
 
+	// 1. Determine Display Name
+	displayName := nodeName
+	hostname, _ := os.Hostname()
+
+	// 2. Allow override via HOST_HOSTNAME (for Docker users passing host $(hostname))
+	if displayName == "" {
+		if hostHostname := strings.TrimSpace(os.Getenv("HOST_HOSTNAME")); hostHostname != "" {
+			displayName = hostHostname
+		} else {
+			displayName = hostname
+		}
+	}
+
+	// 3. Filter Gibberish (12-char hex container IDs)
+	isContainerID := containerIDRe.MatchString(displayName)
+	publicIP := strings.TrimSpace(os.Getenv("URNETWORK_PUBLIC_IP"))
+
+	// 4. Build Compact Dashboard Label
+	var dashboardLabel string
+
+	if ip4 := net.ParseIP(publicIP).To4(); ip4 != nil {
+		parts := strings.Split(ip4.String(), ".")
+		redactedIP := fmt.Sprintf("%s.x.x.%s", parts[0], parts[3])
+
+		if displayName == "" || isContainerID {
+			// Scenario: No useful name. Identity is just the Redacted IP.
+			dashboardLabel = redactedIP
+		} else {
+			// Scenario: We have a useful name. Identity is "Name @ RedactedIP".
+			dashboardLabel = fmt.Sprintf("%s @ %s", displayName, redactedIP)
+		}
+	} else {
+		// Fallback for no IP connectivity
+		if displayName == "" || isContainerID {
+			dashboardLabel = "provider"
+		} else {
+			dashboardLabel = displayName
+		}
+	}
+
+	// 5. Final Description: "Identity [Version]"
+	description := fmt.Sprintf("%s [%s]", dashboardLabel, RequireVersion())
+
 	authClientArgs := &connect.AuthNetworkClientArgs{
-		Description: fmt.Sprintf("provider %s %s", runtime.GOOS, RequireVersion()),
+		Description: description,
 		DeviceSpec:  "",
 	}
 
@@ -1361,10 +1405,20 @@ func provideAuth(ctx context.Context, clientStrategy *connect.ClientStrategy, ap
 	}
 
 	if authClientResult.Error != nil {
-		panic(authClientResult.Error)
+		returnErr = authClientResult.Error
+		return
+	}
+	if authClientResult.Result == nil {
+		returnErr = fmt.Errorf("auth response missing result")
+		return
 	}
 	if authClientResult.Result.Error != nil {
-		panic(fmt.Errorf("%s", authClientResult.Result.Error.Message))
+		if authClientResult.Result.Error.ClientLimitExceeded {
+			returnErr = fmt.Errorf("client limit exceeded: %s", authClientResult.Result.Error.Message)
+			return
+		}
+		returnErr = fmt.Errorf("%w: %s", ErrTokenInvalid, authClientResult.Result.Error.Message)
+		return
 	}
 
 	byClientJwt = authClientResult.Result.ByClientJwt
@@ -1373,14 +1427,26 @@ func provideAuth(ctx context.Context, clientStrategy *connect.ClientStrategy, ap
 	parser := gojwt.NewParser()
 	token, _, err := parser.ParseUnverified(byClientJwt, gojwt.MapClaims{})
 	if err != nil {
-		panic(err)
+		returnErr = fmt.Errorf("failed to parse client JWT from API response: %w", err)
+		return
 	}
 
-	claims := token.Claims.(gojwt.MapClaims)
+	claims, ok := token.Claims.(gojwt.MapClaims)
+	if !ok {
+		returnErr = fmt.Errorf("unexpected claims type in client JWT")
+		return
+	}
 
-	clientId, err = connect.ParseId(claims["client_id"].(string))
+	clientIdStr, ok := claims["client_id"].(string)
+	if !ok {
+		returnErr = fmt.Errorf("client_id claim missing or not a string in client JWT")
+		return
+	}
+
+	clientId, err = connect.ParseId(clientIdStr)
 	if err != nil {
-		panic(err)
+		returnErr = fmt.Errorf("invalid client_id in JWT claims: %w", err)
+		return
 	}
 
 	return
