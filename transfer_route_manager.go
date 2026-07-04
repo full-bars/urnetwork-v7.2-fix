@@ -815,15 +815,15 @@ func (self *MultiRouteSelector) WriteDetailed(ctx context.Context, transferFrame
 
 			switch chosenIndex {
 			case contextDoneIndex:
-				// MessagePoolReturn(transferFrameBytes)
+				MessagePoolReturn(transferFrameBytes)
 				return false, errors.New("Context done")
 			case doneIndex:
-				// MessagePoolReturn(transferFrameBytes)
+				MessagePoolReturn(transferFrameBytes)
 				return false, errors.New("Done")
 			case transportUpdateIndex:
 				// new routes, try again
 			case timeoutIndex:
-				// MessagePoolReturn(transferFrameBytes)
+				MessagePoolReturn(transferFrameBytes)
 				return false, nil
 			default:
 				// a route

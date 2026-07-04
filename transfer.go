@@ -139,6 +139,7 @@ func DefaultSendBufferSettingsWithBufferSize(bufferSize int) *SendBufferSettings
 		ResendQueueMaxByteCount: mib(4),
 		ContractFillFraction:    0.8,
 		ProtocolVersion:         DefaultProtocolVersion,
+		MaxResendCount:          16,
 	}
 }
 
@@ -168,7 +169,7 @@ func DefaultReceiveBufferSettingsWithBufferSize(bufferSize int) *ReceiveBufferSe
 		ReceiveQueueMaxByteCount: mib(2) + kib(512),
 		AllowLegacyNack:          true,
 		MaxOpenReceiveContract:   4,
-		ProtocolVersion:          DefaultProtocolVersion,
+		ProtocolVersion:         DefaultProtocolVersion,
 	}
 }
 
@@ -1440,6 +1441,8 @@ type SendBufferSettings struct {
 	ContractFillFraction float32
 
 	ProtocolVersion int
+
+	MaxResendCount int
 }
 
 type sendSequenceId struct {
@@ -2195,6 +2198,12 @@ func (self *SendSequence) Run() {
 				}
 
 				item.sendCount += 1
+				maxResendCount := self.sendBufferSettings.MaxResendCount
+				if maxResendCount > 0 && item.sendCount >= maxResendCount {
+					item.resendTime = sendTime.Add(self.sendBufferSettings.AckTimeout)
+					self.resendQueue.Add(item)
+					continue
+				}
 				// back off the resend timeout multiplicatively with each resend
 				// of the same item, up to `MaxResendInterval`. When acks are
 				// delayed (not lost) by queueing, a flat timeout re-sends the
