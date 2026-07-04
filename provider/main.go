@@ -16,8 +16,10 @@ import (
 	"regexp"
 	"runtime"
 	"runtime/debug"
+	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -54,6 +56,19 @@ func validateJWTExpiry(byJwt string) error {
 }
 
 var provideStartTime time.Time
+
+type ecoState int
+
+const (
+	ecoStateNormal ecoState = iota
+	ecoStatePressure
+	ecoStateCritical
+)
+
+var (
+	ecoMonitorStarted atomic.Bool
+	startEcoMonitor   = func(ctx context.Context) { go runEcoMemoryMonitor(ctx) }
+)
 
 func init() {
 	// debug.SetGCPercent(10)
@@ -629,6 +644,165 @@ func provide(opts docopt.Opts) {
 
 	// exit
 	os.Exit(0)
+}
+
+func applyTurboSettings(clientSettings *connect.ClientSettings, localUserNatSettings *connect.LocalUserNatSettings) {
+	profile := os.Getenv("URNETWORK_PROFILE")
+	var windowSize uint32
+	var queueBytes connect.ByteCount
+	switch profile {
+	case "turbo-v4":
+		windowSize = 4 * 1024 * 1024
+		queueBytes = 8 * 1024 * 1024
+	case "turbo-v8":
+		windowSize = 8 * 1024 * 1024
+		queueBytes = 16 * 1024 * 1024
+	default:
+		return
+	}
+
+	localUserNatSettings.TcpBufferSettings.MaxWindowSize = windowSize
+	localUserNatSettings.UdpBufferSettings.MaxWindowSize = windowSize
+	localUserNatSettings.SequenceBufferSize = 512
+	localUserNatSettings.TcpBufferSettings.SequenceBufferSize = 512
+	localUserNatSettings.UdpBufferSettings.SequenceBufferSize = 512
+	clientSettings.SendBufferSettings.ResendQueueMaxByteCount = queueBytes
+	clientSettings.ReceiveBufferSettings.ReceiveQueueMaxByteCount = queueBytes
+	clientSettings.SendBufferSettings.SequenceBufferSize = 64
+	clientSettings.ReceiveBufferSettings.SequenceBufferSize = 64
+	clientSettings.WebRtcSettings.ReceiveBufferSize = connect.ByteCount(windowSize) * 2
+	clientSettings.ContractManagerSettings.ContractTransferByteSeqScale = 2
+	if os.Getenv("GOGC") == "" {
+		debug.SetGCPercent(200)
+	}
+}
+
+func applyEcoSettings(maxMemory connect.ByteCount) {
+	if os.Getenv("URNETWORK_PROFILE") != "eco" {
+		return
+	}
+	if os.Getenv("GOGC") == "" {
+		debug.SetGCPercent(50)
+	}
+	if os.Getenv("GOMEMLIMIT") == "" && maxMemory == 0 {
+		ramBytes := connect.DetectEffectiveRAMLimitBytes()
+		ecoLimit := ramBytes * 75 / 100
+		debug.SetMemoryLimit(ecoLimit)
+	}
+}
+
+func readMemAvailableMiB() int64 {
+	f, err := os.Open("/proc/meminfo")
+	if err != nil {
+		return -1
+	}
+	defer f.Close()
+	scanner := bufio.NewScanner(f)
+	for scanner.Scan() {
+		line := scanner.Text()
+		if strings.HasPrefix(line, "MemAvailable:") {
+			fields := strings.Fields(line)
+			if len(fields) >= 2 {
+				if v, err := strconv.ParseInt(fields[1], 10, 64); err == nil {
+					return v / 1024
+				}
+			}
+		}
+	}
+	return -1
+}
+
+func readCgroupAvailableMiB() int64 {
+	const oneTiB = int64(1) << 40
+	maxData, maxErr := os.ReadFile("/sys/fs/cgroup/memory.max")
+	currData, currErr := os.ReadFile("/sys/fs/cgroup/memory.current")
+	if maxErr == nil && currErr == nil {
+		maxStr := strings.TrimSpace(string(maxData))
+		if maxStr != "max" {
+			limit, err1 := strconv.ParseInt(maxStr, 10, 64)
+			curr, err2 := strconv.ParseInt(strings.TrimSpace(string(currData)), 10, 64)
+			if err1 == nil && err2 == nil && limit > 0 && limit < oneTiB {
+				if avail := (limit - curr) / 1024 / 1024; avail >= 0 {
+					return avail
+				}
+				return 0
+			}
+		}
+	}
+	limitData, limitErr := os.ReadFile("/sys/fs/cgroup/memory/memory.limit_in_bytes")
+	usageData, usageErr := os.ReadFile("/sys/fs/cgroup/memory/memory.usage_in_bytes")
+	if limitErr == nil && usageErr == nil {
+		limit, err1 := strconv.ParseInt(strings.TrimSpace(string(limitData)), 10, 64)
+		usage, err2 := strconv.ParseInt(strings.TrimSpace(string(usageData)), 10, 64)
+		if err1 == nil && err2 == nil && limit > 0 && limit < oneTiB {
+			if avail := (limit - usage) / 1024 / 1024; avail >= 0 {
+				return avail
+			}
+			return 0
+		}
+	}
+	return -1
+}
+
+func runEcoMemoryMonitor(ctx context.Context) {
+	const (
+		criticalMiB int64 = 150
+		pressureMiB int64 = 300
+		recoveryMiB int64 = 450
+		gcNormal           = 50
+		gcPressure         = 25
+		gcCritical         = 10
+	)
+	state := ecoStateNormal
+	ticker := time.NewTicker(30 * time.Second)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			avail := readMemAvailableMiB()
+			if avail < 0 {
+				continue
+			}
+			if cgroupAvail := readCgroupAvailableMiB(); cgroupAvail >= 0 && cgroupAvail < avail {
+				avail = cgroupAvail
+			}
+			var next ecoState
+			switch {
+			case avail <= criticalMiB:
+				next = ecoStateCritical
+			case avail <= pressureMiB:
+				next = ecoStatePressure
+			case avail >= recoveryMiB:
+				next = ecoStateNormal
+			default:
+				if state == ecoStateCritical {
+					runtime.GC()
+				}
+				continue
+			}
+			if next == state {
+				if state == ecoStateCritical {
+					runtime.GC()
+				}
+				continue
+			}
+			state = next
+			switch state {
+			case ecoStateNormal:
+				debug.SetGCPercent(gcNormal)
+				tlog("[eco] memory pressure eased (available=%dMiB), GOGC=%d\n", avail, gcNormal)
+			case ecoStatePressure:
+				debug.SetGCPercent(gcPressure)
+				tlog("[eco] memory pressure (available=%dMiB, GOGC=%d → %d)\n", avail, gcNormal, gcPressure)
+			case ecoStateCritical:
+				runtime.GC()
+				debug.SetGCPercent(gcCritical)
+				tlog("[eco] memory critical (available=%dMiB, GOGC=%d → %d, forcing GC)\n", avail, gcNormal, gcCritical)
+			}
+		}
+	}
 }
 
 func applyPoolAutoSize(maxMemory connect.ByteCount) {
