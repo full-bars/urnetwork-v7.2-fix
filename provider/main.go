@@ -19,6 +19,7 @@ import (
 	"runtime"
 	"runtime/debug"
 	"runtime/metrics"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -624,7 +625,6 @@ func runOutageWatcher(ctx context.Context, nodeName, envWebhookURL string) {
 }
 
 func provide(opts docopt.Opts) {
-	provideStartTime = time.Now()
 	port, _ := opts.Int("--port")
 
 	apiUrl, err := opts.String("--api_url")
@@ -649,8 +649,10 @@ func provide(opts docopt.Opts) {
 		connect.ResizeMessagePools(maxMemory / 8)
 		debug.SetMemoryLimit(maxMemory)
 	}
-
 	applyPoolAutoSize(maxMemory)
+
+	provideStartTime = time.Now()
+	tlog("❤️ [startup] provider version=%s\n", RequireVersion())
 
 	event := connect.NewEventWithContext(context.Background())
 	event.SetOnSignals(syscall.SIGINT, syscall.SIGQUIT, syscall.SIGTERM)
@@ -658,17 +660,82 @@ func provide(opts docopt.Opts) {
 	ctx, cancel := context.WithCancel(event.Ctx())
 	defer cancel()
 
-	go runOutageWatcher(ctx, os.Getenv("URNETWORK_NODE_NAME"), os.Getenv("URNETWORK_ALERT_WEBHOOK"))
+	// Hourly pulse: wakes all stalled transports and proxies so they retry
+	// connections without needing a provider restart.
+	go func() {
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(1 * time.Hour):
+				if connect.ProxyHealthCount() > 0 {
+					_, dead, degraded, _, connecting := connect.ProxyHealthSnapshot()
+					down := len(dead) + len(degraded)
+					tlog("[pulse] waking stalled transports: down=%d dead=%d degraded=%d connecting=%d\n",
+						down, len(dead), len(degraded), len(connecting))
+				}
+				connect.TriggerPulse()
+			}
+		}
+	}()
+
+	if os.Getenv("URNETWORK_PROFILE") == "eco" {
+		startEcoMonitorOnce(ctx)
+	}
+
+	nodeName := strings.TrimSpace(os.Getenv("URNETWORK_NODE_NAME"))
+
+	// Determine a temporary display name for the outage watcher/heartbeat
+	watcherName := nodeName
+	if watcherName == "" {
+		watcherName, _ = os.Hostname()
+		if containerIDRe.MatchString(watcherName) {
+			watcherName = "provider"
+		}
+	}
+
+	go runOutageWatcher(ctx, watcherName, os.Getenv("URNETWORK_ALERT_WEBHOOK"))
 	go runHealthHeartbeat(ctx, provideStartTime, os.Getenv("URNETWORK_PROFILE"))
+	go runBandwidthReporter(ctx, watcherName, watcherName, os.Getenv("URNETWORK_REPORT_URL"), provideStartTime)
+	go runHeartbeatReporter(ctx, watcherName, watcherName, os.Getenv("URNETWORK_REPORT_URL"), provideStartTime)
 	go runJWTRefresher(ctx, apiUrl)
 	go runEarningWindows(ctx)
 	go runProfitHeartbeat(ctx)
+
+	proxyURLs := resolveProxyURLs(opts)
+	proxyURLRefresh := resolveDuration(opts, "--proxy_url_refresh", "PROXY_URL_REFRESH", 15*time.Minute)
+	proxyURLMax := resolveInt(opts, "--proxy_url_max", "PROXY_URL_MAX", 0)
+	cleanupScope := resolveString(opts, "--proxy_dead_cleanup_scope", "PROXY_DEAD_CLEANUP_SCOPE", "none")
+	cleanupInterval := resolveDuration(opts, "--proxy_dead_cleanup_interval", "PROXY_DEAD_CLEANUP_INTERVAL", 24*time.Hour)
+
+	// Extract API host:port for the reachability probe
+	apiProbeHost := defaultAPIHost
+	apiProbePort := uint16(defaultAPIPort)
+	if apiUrl != "" {
+		if h, p, err := net.SplitHostPort(strings.TrimPrefix(strings.TrimPrefix(apiUrl, "https://"), "http://")); err == nil {
+			apiProbeHost = h
+			if port, err := strconv.Atoi(p); err == nil && port >= 1 && port <= 65535 {
+				apiProbePort = uint16(port)
+			}
+		} else {
+			// No port in URL, just a hostname
+			cleaned := strings.TrimPrefix(strings.TrimPrefix(apiUrl, "https://"), "http://")
+			if cleaned != "" {
+				apiProbeHost = cleaned
+			}
+		}
+	}
 	go paceMonitor(ctx)
 
-	provideWithProxy := func(proxySettings *connect.ProxySettings) {
-		proxyCtx, proxyCancel := context.WithCancel(ctx)
-		defer proxyCancel()
+	// Declared here (rather than next to the startup loop below) so
+	// provideWithProxy can close over them directly: on a permanent give-up,
+	// it needs to remove its own entry to make itself eligible for re-add by
+	// the next reload() reconciliation pass. Both the initial startup loop
+	// and ProxyReloader share this same map/mutex pair.
+	var proxyCancelMu sync.Mutex
+	proxyCancelMap := map[string]context.CancelFunc{}
 
+	provideWithProxy := func(proxyCtx context.Context, proxySettings *connect.ProxySettings, isNative bool, isURLSourced bool) {
 		clientStrategySettings := connect.DefaultClientStrategySettings()
 		clientStrategySettings.ProxySettings = proxySettings
 		clientSettings := connect.DefaultClientSettings()
@@ -688,6 +755,17 @@ func provide(opts docopt.Opts) {
 			clientSettings.EncryptionSettings.ProvideTlsPrivateKeyPem = keyPem
 		}
 		localUserNatSettings := connect.DefaultLocalUserNatSettings()
+
+		autoEco := connect.ApplyAutoTuning(clientSettings, localUserNatSettings)
+		applyLowmodeSettings(clientSettings, localUserNatSettings)
+		applyTurboSettings(clientSettings, localUserNatSettings)
+
+		profile := os.Getenv("URNETWORK_PROFILE")
+		if profile == "eco" || autoEco {
+			startEcoMonitorOnce(ctx)
+		}
+
+		applyEcoSettings(maxMemory)
 		localUserNatSettings.TcpBufferSettings.ConnectSettings = clientStrategySettings.ConnectSettings
 		localUserNatSettings.UdpBufferSettings.ConnectSettings = clientStrategySettings.ConnectSettings
 		remoteUserNatProviderSettings := connect.DefaultRemoteUserNatProviderSettings()
@@ -723,48 +801,189 @@ func provide(opts docopt.Opts) {
 		}
 
 		byClientJwt, clientId, err := func() (string, connect.Id, error) {
+			// Consecutive auth failures (network errors, API timeouts, or token
+			// rejection). After maxAuthFailures the proxy gives up and goes offline
+			// until the next hourly pulse.
+			// "Jwt does not exist" is a configuration issue, not a network/token
+			// error — it retries indefinitely until the user runs 'urnetwork auth'.
+			//
+			// A proxy that has never once succeeded gets a much shorter leash
+			// than one with a proven track record: on a free list that's mostly
+			// open-port-but-broken entries, ten retries against something that's
+			// never worked even once is ten auth-rate-limiter slots spent
+			// re-confirming what's already very likely true, instead of being
+			// spent discovering whether a fresh, untried candidate works.
+			const provenMaxAuthFailures = 10
+			const unprovenMaxAuthFailures = 3
+			maxAuthFailures := provenMaxAuthFailures
+			if proxySettings != nil && !globalProvenProxies.HasSucceeded(proxySettings.Address) {
+				maxAuthFailures = unprovenMaxAuthFailures
+			}
 			authFailures := 0
 			for {
-				admitFailureCount := 0
-				if proxySettings != nil {
-					admitFailureCount = globalProxyFailureHistory.FailureCount(proxySettings.Address)
-				}
-				release, waitErr := globalProxyAdmissionGate.Admit(proxyCtx, admitFailureCount)
-				if waitErr != nil {
-					return "", connect.Id{}, waitErr
-				}
-				byClientJwt, clientId, err := provideAuth(proxyCtx, clientStrategy, apiUrl, opts, os.Getenv("URNETWORK_NODE_NAME"))
-				if proxySettings != nil {
-					if err == nil {
-						globalProvenProxies.MarkSucceeded(proxySettings.Address)
-						globalProxyFailureHistory.Reset(proxySettings.Address)
-					}
-					globalAuthRateLimiter.ReportResultForProxy(err, globalProvenProxies.HasSucceeded(proxySettings.Address))
+				var err error
+				var byClientJwt string
+				var clientId connect.Id
+
+				// Only URL-sourced proxies get the pre-auth SOCKS5 reachability probe.
+				// File/internal lists are operator-curated (paid) endpoints that should
+				// always attempt auth; the probe exists to cheaply skip dead entries in
+				// large free URL lists before spending a shared auth-rate-limiter slot.
+				if proxySettings != nil && isURLSourced && !probeProxySocks5(proxyCtx, proxySettings.Address, proxyProbeTimeout) {
+					// The proxy itself isn't even speaking SOCKS5 right now — either
+					// the port is dead, or something is listening but isn't a real
+					// SOCKS5 endpoint (open port with a broken/wrong service, a
+					// captive portal, etc). Either way that's a dead local hop, not a
+					// signal about the API's health. Skip the auth attempt (and the
+					// shared rate limiter) entirely rather than spending a slot and
+					// reporting a timeout that would falsely look like the API is
+					// overloaded and throttle every other proxy's auth rate for no
+					// reason.
+					err = fmt.Errorf("proxy unreachable: %s", proxySettings.Address)
 				} else {
-					globalAuthRateLimiter.ReportResult(err)
+					// Weight this wait by the proxy's lifetime failure count
+					// (persists across the 15-minute URL-source requeue, unlike
+					// the local authFailures counter) so a chronically dead
+					// address doesn't keep re-entering the lottery at full
+					// "untried" priority every time it comes back.
+					admitFailureCount := authFailures
+					if proxySettings != nil {
+						admitFailureCount = globalProxyFailureHistory.FailureCount(proxySettings.Address)
+					}
+					release, waitErr := globalProxyAdmissionGate.Admit(proxyCtx, admitFailureCount)
+					if waitErr != nil {
+						return "", connect.Id{}, waitErr
+					}
+					byClientJwt, clientId, err = provideAuth(proxyCtx, clientStrategy, apiUrl, opts, nodeName)
+					release()
+					if proxySettings != nil {
+						if err == nil {
+							globalProvenProxies.MarkSucceeded(proxySettings.Address)
+							globalProxyFailureHistory.Reset(proxySettings.Address)
+						}
+						globalAuthRateLimiter.ReportResultForProxy(err, globalProvenProxies.HasSucceeded(proxySettings.Address))
+					} else {
+						globalAuthRateLimiter.ReportResult(err)
+					}
+					if err == nil {
+						return byClientJwt, clientId, nil
+					}
 				}
-				release()
-				if err == nil {
-					return byClientJwt, clientId, nil
+
+				if errors.Is(err, ErrTokenInvalid) {
+					shmLogFatal(78, "token invalid or expired — exiting so the startup script can refresh it")
 				}
-		if proxySettings != nil {
-			globalProxyFailureHistory.RecordFailure(proxySettings.Address)
-		}
-		authFailures++
-		if errors.Is(err, ErrTokenInvalid) {
-			fmt.Fprintf(os.Stderr, "FATAL [exit 78]: token invalid or expired — exiting so the startup script can refresh it\n")
-			os.Exit(78)
-		}
-		retryDelay := time.Duration(500+mathrand.Intn(10000)) * time.Millisecond
-				fmt.Printf("init proxy auth failed. Will retry in %.2fs\n", float64(retryDelay/time.Millisecond)/1000.0)
+
+				if strings.Contains(err.Error(), "Jwt does not exist") {
+					authFailures = 0
+					fmt.Printf("Authentication missing. Please run 'urnetwork auth' to configure your provider.\n")
+					retryDelay := 30 * time.Second
+					select {
+					case <-proxyCtx.Done():
+						return "", connect.Id{}, proxyCtx.Err()
+					case <-time.After(retryDelay):
+						continue
+					}
+				}
+
+				authFailures++
+				if proxySettings != nil {
+					globalProxyFailureHistory.RecordFailure(proxySettings.Address)
+				}
+				if authFailures >= maxAuthFailures {
+					cause := classifyAuthFailureCause(err)
+					// URL-sourced (free lists) keep the short leash: give up and let
+					// the requeue path bring them back later, so a huge mostly-dead
+					// list does not pin a goroutine per entry. Operator-curated
+					// proxies (file/internal/direct) must never give up — a paid or
+					// direct endpoint that is briefly unreachable at boot, or a
+					// transient API error, should not cost the proxy until the next
+					// full restart (which wipes everyone's 8-12h warmup). Fall back to
+					// a slow, capped retry instead and keep trying.
+					if isURLSourced {
+						return "", connect.Id{}, fmt.Errorf("authentication failed after %d attempts — %s: %w", maxAuthFailures, cause, err)
+					}
+					slowDelay := proxyAuthSlowRetryDelay(authFailures - maxAuthFailures + 1)
+					if proxySettings != nil {
+						tlog("[proxy][init] proxy[%d] (%s) auth still failing after %d attempts (%s); not giving up, next retry in %s\n",
+							proxySettings.Index, proxySettings.Address, authFailures, cause, formatDuration(slowDelay))
+					} else if isNative {
+						tlog("[proxy][init] proxy[0] (direct) auth still failing after %d attempts (%s); not giving up, next retry in %s\n",
+							authFailures, cause, formatDuration(slowDelay))
+					} else {
+						tlog("[init] auth still failing after %d attempts (%s); not giving up, next retry in %s\n",
+							authFailures, cause, formatDuration(slowDelay))
+					}
+					select {
+					case <-proxyCtx.Done():
+						return "", connect.Id{}, proxyCtx.Err()
+					case <-time.After(slowDelay):
+						continue
+					}
+				}
+
+				retryDelay := proxyAuthRetryDelay(err, authFailures)
+				if proxySettings != nil {
+					tlog("[proxy][init] proxy[%d] (%s) auth failed (attempt %d/%d): %v. Will retry in %.2fs\n",
+						proxySettings.Index, proxySettings.Address, authFailures, maxAuthFailures, err, float64(retryDelay/time.Millisecond)/1000.0)
+				} else if isNative {
+					tlog("[proxy][init] proxy[0] (direct) auth failed (attempt %d/%d): %v. Will retry in %.2fs\n",
+						authFailures, maxAuthFailures, err, float64(retryDelay/time.Millisecond)/1000.0)
+				} else {
+					tlog("[init] auth failed (attempt %d/%d): %v. Will retry in %.2fs\n", authFailures, maxAuthFailures, err, float64(retryDelay/time.Millisecond)/1000.0)
+				}
 				select {
 				case <-proxyCtx.Done():
+					return "", connect.Id{}, proxyCtx.Err()
 				case <-time.After(retryDelay):
 				}
 			}
 		}()
 		if err != nil {
-			panic(err)
+			if proxySettings != nil {
+				if isURLSourced {
+					proxyCancelMu.Lock()
+					delete(proxyCancelMap, proxySettings.Address)
+					proxyCancelMu.Unlock()
+
+					giveUpCount := globalProxyFailureHistory.RecordGiveUp(proxySettings.Address)
+					if giveUpCount >= proxyURLGiveUpEvictAfterCycles {
+						if evictErr := evictProxyURLAddress(proxySettings.Address); evictErr != nil {
+							fmt.Fprintf(os.Stderr, "[proxy][init] proxy[%d] (%s) could not evict after %d give-ups: %v\n",
+								proxySettings.Index, proxySettings.Address, giveUpCount, evictErr)
+						} else {
+							fmt.Fprintf(os.Stderr, "[proxy][init] proxy[%d] (%s) authentication failed after retries: %v. Permanently removed after %d give-ups, will not be retried.\n",
+								proxySettings.Index, proxySettings.Address, err, giveUpCount)
+						}
+					} else {
+						delay := proxyURLGiveUpRetryDelay(giveUpCount)
+						// Enforce the backoff at launch time, not just by
+						// scheduling a one-shot reload: record the earliest
+						// time this address may be relaunched so the reload
+						// path skips it until the window elapses. Otherwise any
+						// other reload (another proxy's give-up, a URL refresh)
+						// would relaunch it immediately and defeat the backoff.
+						globalProxyFailureHistory.SetBackoffUntil(proxySettings.Address, time.Now().Add(delay))
+						if reloadPath, pathErr := proxyReloadPath(); pathErr == nil {
+							time.AfterFunc(delay, func() {
+								if err := writeReloadTrigger(reloadPath); err != nil {
+									tlog("[proxy] warn: reload trigger write failed: %v\n", err)
+								}
+							})
+						}
+						fmt.Fprintf(os.Stderr, "[proxy][init] proxy[%d] (%s) authentication failed after retries: %v. URL-sourced, give-up %d of %d before eviction, will retry automatically in %s.\n",
+							proxySettings.Index, proxySettings.Address, err, giveUpCount, proxyURLGiveUpEvictAfterCycles, formatDuration(delay))
+					}
+				} else {
+					fmt.Fprintf(os.Stderr, "[proxy][init] proxy[%d] (%s) authentication failed after retries: %v (proxy will remain offline; run 'urnet-tools proxy refresh' after fixing the underlying issue)\n",
+						proxySettings.Index, proxySettings.Address, err)
+				}
+			} else if isNative {
+				fmt.Fprintf(os.Stderr, "[proxy][init] proxy[0] (direct) authentication failed after retries: %v (proxy will remain offline, retry on next hourly pulse)\n", err)
+			} else {
+				fmt.Fprintf(os.Stderr, "[init] authentication failed after retries: %v\n", err)
+			}
+			return
 		}
 
 		instanceId := connect.NewId()
@@ -811,18 +1030,18 @@ func provide(opts docopt.Opts) {
 		}
 		connect.NewPlatformTransportWithDefaults(proxyCtx, clientStrategy, connectClient.RouteManager(), connectUrl, auth)
 		// go platformTransport.Run(connectClient.RouteManager())
-
-		localUserNat := connect.NewLocalUserNat(proxyCtx, clientId.String(), localUserNatSettings)
-		defer localUserNat.Close()
-
 		var bw *connect.ProxyBandwidth
 		if proxySettings != nil {
 			bw = connect.RegisterProxyBandwidth(proxySettings.Index)
+		} else if isNative {
+			bw = connect.RegisterProxyBandwidth(0)
 		}
+
+		localUserNat := connect.NewLocalUserNat(proxyCtx, clientId.String(), localUserNatSettings)
+		defer localUserNat.Close()
 		remoteUserNatProvider := connect.NewRemoteUserNatProvider(connectClient, localUserNat, bw, remoteUserNatProviderSettings)
 		defer remoteUserNatProvider.Close()
-
-		if proxySettings != nil && bw != nil {
+		if proxySettings != nil {
 			startProxyBenchmarks(proxyCtx, bw, proxySettings)
 		}
 
@@ -832,6 +1051,10 @@ func provide(opts docopt.Opts) {
 		}
 		connectClient.ContractManager().SetProvideModes(provideModes)
 
+		if proxySettings != nil {
+			registerContractCallback(proxySettings.Index, connectClient)
+		}
+
 		select {
 		case <-proxyCtx.Done():
 		}
@@ -839,10 +1062,128 @@ func provide(opts docopt.Opts) {
 
 	var wg sync.WaitGroup
 
-	if allProxySettings := readProxySettings(); 0 < len(allProxySettings) {
+	// Sentinel goroutine to prevent wg.Wait() from unblocking
+	// if the hot-reloader drops active proxies to zero.
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		<-ctx.Done()
+	}()
+
+	if profile := os.Getenv("URNETWORK_PROFILE"); profile == "turbo-v4" || profile == "turbo-v8" {
+		var windowMiB, queueMiB uint32
+		switch profile {
+		case "turbo-v4":
+			windowMiB, queueMiB = 4, 8
+		case "turbo-v8":
+			windowMiB, queueMiB = 8, 16
+		}
+		tlog("[turbo] profile=%s window=%dMiB resendQueue=%dMiB\n", profile, windowMiB, queueMiB)
+	}
+
+	// Load proxy.state to assign address-stable IDs. Known addresses keep their ID
+	// across restarts/reloads; new addresses get the next monotonic counter value.
+	proxyState, stateErr := readProxyState()
+	if stateErr != nil {
+		tlog("[proxy] warning: could not read proxy.state: %v\n", stateErr)
+		proxyState = &ProxyState{Proxies: map[string]ProxyEntry{}}
+	}
+	proxyState.StartedAt = provideStartTime
+
+	// Advance the ID counter above any IDs already in state so they are never reused.
+	highestID := -1
+	for _, e := range proxyState.Proxies {
+		if e.ID > highestID {
+			highestID = e.ID
+		}
+	}
+	initProxyIDCounter(highestID)
+
+	// Select the proxy source: external file (Workflow A) or internal config (Workflow B).
+	proxyFile, _ := opts.String("--proxy_file")
+	var allProxySettings []*connect.ProxySettings
+	if proxyFile != "" {
+		settings, err := readProxySettingsFromFile(proxyFile)
+		if err != nil {
+			shmLogFatal(20, "[proxy] could not read proxy file: %v", err)
+		}
+		if len(settings) == 0 {
+			shmLogFatal(21, "[proxy] proxy file %s contained no valid proxies (expected one ip:port:user:pass per line)", proxyFile)
+		}
+		allProxySettings = settings
+		proxyState.Source = proxyFile
+	} else {
+		allProxySettings = readProxySettings()
+		proxyState.Source = ""
+	}
+
+	// Merge in any already-cached URL-sourced proxies (Workflow A/B + URL
+	// source are additive, not mutually exclusive). proxySourceOf records
+	// each address's provenance for tagProxySourceIfUnset below.
+	primarySource := "internal"
+	if proxyFile != "" {
+		primarySource = "file"
+	}
+	proxyDesiredSet := make(map[string]*connect.ProxySettings, len(allProxySettings))
+	proxySourceOf := make(map[string]string, len(allProxySettings))
+	for _, s := range allProxySettings {
+		proxyDesiredSet[s.Address] = s
+		proxySourceOf[s.Address] = primarySource
+	}
+	if urlState, err := readProxyURLState(); err != nil {
+		tlog("[proxy][url] warning: could not read proxy_url.json: %v\n", err)
+	} else {
+		mergeProxyURLCache(proxyDesiredSet, proxySourceOf, urlState)
+	}
+	allProxySettings = allProxySettings[:0]
+	for _, s := range proxyDesiredSet {
+		allProxySettings = append(allProxySettings, s)
+	}
+	// Sort so file-sourced (or internal-config) proxies launch before
+	// URL-sourced ones. backoffPacer uses the index in this slice to
+	// determine initial delay, so file proxies get a head start of
+	// ~len(file_proxies) * staggerMs before URL proxies begin connecting.
+	sort.SliceStable(allProxySettings, func(i, j int) bool {
+		si := proxySourceOf[allProxySettings[i].Address]
+		sj := proxySourceOf[allProxySettings[j].Address]
+		if si == "url" && sj != "url" {
+			return false
+		}
+		if si != "url" && sj == "url" {
+			return true
+		}
+		return false
+	})
+
+	// ALWAYS start the native [direct] connection as proxy[0].
+	// We run this exactly like a proxy so it registers in telemetry and earns bandwidth.
+	wg.Add(1)
+	nativeCtx, nativeCancel := context.WithCancel(ctx)
+	// We don't add nativeCancel to the proxyCancelMap so it is immune to hot-reload deletions.
+	go connect.HandleError(func() {
+		defer wg.Done()
+		defer nativeCancel()
+		defer connect.UnregisterProxy(0)
+
+		// Register it early so it shows up in health reports immediately as [direct]
+		connect.RegisterProxy(0, "direct")
+		provideWithProxy(nativeCtx, nil, true, false)
+	})
+
+	// Persist the initial state snapshot now that all IDs are resolved.
+	proxyState.NextID = currentProxyIDCounter()
+	if err := writeProxyState(proxyState); err != nil {
+		tlog("[proxy] warning: could not write proxy.state: %v\n", err)
+	}
+
+	if 0 < len(allProxySettings) {
 		fmt.Printf("Using %d proxy servers:\n", len(allProxySettings))
 
-		for i, proxySettings := range allProxySettings {
+		for _, proxySettings := range allProxySettings {
+			stableID := resolveProxyID(proxyState, proxySettings.Address)
+			proxySettings.Index = stableID
+			tagProxySourceIfUnset(proxyState, proxySettings.Address, proxySourceOf[proxySettings.Address])
+			connect.RegisterProxy(stableID, proxySettings.Address)
 			var user string
 			var password string
 			if proxySettings.Auth != nil {
@@ -850,33 +1191,61 @@ func provide(opts docopt.Opts) {
 				password = proxySettings.Auth.Password
 			}
 			fmt.Printf("  proxy[%d] %s (%s/%s)\n",
-				i,
+				stableID,
 				proxySettings.Address,
 				obfuscateUser(user),
 				obfuscatePassword(password),
 			)
 		}
+
 		for i, proxySettings := range allProxySettings {
+			proxyCtx, proxyCancel := context.WithCancel(ctx)
+			proxyCancelMu.Lock()
+			proxyCancelMap[proxySettings.Address] = proxyCancel
+			proxyCancelMu.Unlock()
+
+			stableID := proxySettings.Index
+			proxyIdx := i
+			isURLSourced := proxySourceOf[proxySettings.Address] == "url"
 			wg.Add(1)
 			go connect.HandleError(func() {
 				defer wg.Done()
+				defer connect.UnregisterProxy(stableID)
+				defer proxyCancel()
 
-				initialDelay := time.Duration(i) * 100 * time.Millisecond
-				select {
-				case <-ctx.Done():
-				case <-time.After(initialDelay):
+				staggerMs := 150
+				if isURLSourced {
+					staggerMs = 500
 				}
+				now := time.Now()
+				if !backoffPacer(proxyIdx, staggerMs, now, proxyCtx) {
+					return
+				}
+				proxyLaunchCount.Add(1)
 
-				provideWithProxy(proxySettings)
+				provideWithProxy(proxyCtx, proxySettings, false, isURLSourced)
 			})
 		}
-	} else {
-		wg.Add(1)
-		go connect.HandleError(func() {
-			defer wg.Done()
-			provideWithProxy(nil)
-		})
 	}
+
+	// Start the hot-reload watcher: it polls ~/.urnetwork/proxy.reload and applies
+	// add/remove diffs to the running proxy set without restarting the provider.
+	reloader := &ProxyReloader{
+		cancelMap:       proxyCancelMap,
+		cancelMapMu:     &proxyCancelMu,
+		state:           proxyState,
+		sourcePath:      proxyFile,
+		parentCtx:       ctx,
+		wg:              &wg,
+		spawnProxy:      provideWithProxy,
+		drainingProxies: make(map[string]context.CancelFunc),
+	}
+	reloader.StartWatcher(ctx)
+
+	go runProxyURLFetcher(ctx, proxyURLs, proxyURLRefresh, proxyURLMax, apiProbeHost, apiProbePort)
+	go runURLProxyReaper(ctx, apiProbeHost, apiProbePort)
+	go pruneURLProxyBlacklist(ctx)
+	go runProxyURLCleanup(ctx, cleanupScope, cleanupInterval)
 
 	if 0 < port {
 		fmt.Printf(
@@ -909,6 +1278,8 @@ func provide(opts docopt.Opts) {
 	// exit
 	os.Exit(0)
 }
+
+
 
 func backoffPacer(n int, staggerMs int, now time.Time, proxyCtx context.Context) bool {
 	if staggerMs <= 0 {
