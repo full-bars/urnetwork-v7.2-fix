@@ -7,7 +7,7 @@ import (
 
 	"container/heap"
 
-	"github.com/urnetwork/connect/v2026/protocol"
+	"github.com/urnetwork/connect/protocol"
 )
 
 type rttWindowItem struct {

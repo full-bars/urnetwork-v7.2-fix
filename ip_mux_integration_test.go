@@ -8,7 +8,7 @@ import (
 
 	"golang.org/x/net/dns/dnsmessage"
 
-	"github.com/urnetwork/connect/v2026/protocol"
+	"github.com/urnetwork/connect/protocol"
 )
 
 // TestUpgradeMuxMultiClientIntegration interposes the UpgradeMux on a real

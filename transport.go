@@ -21,7 +21,7 @@ import (
 	"github.com/gorilla/websocket"
 	quic "github.com/quic-go/quic-go"
 
-	"github.com/urnetwork/connect/v2026/protocol"
+	"github.com/urnetwork/connect/protocol"
 )
 
 // note that it is possible to have multiple transports for the same client destination

@@ -8,7 +8,7 @@ import (
 	"fmt"
 	"sync"
 
-	"github.com/urnetwork/connect/v2026/protocol"
+	"github.com/urnetwork/connect/protocol"
 )
 
 // ClientKeyManager owns the client's long-lived Ed25519 identity

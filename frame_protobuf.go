@@ -25,7 +25,7 @@ import (
 
 	"google.golang.org/protobuf/encoding/protowire"
 
-	"github.com/urnetwork/connect/v2026/protocol"
+	"github.com/urnetwork/connect/protocol"
 )
 
 // proto wire types

@@ -14,7 +14,7 @@ import (
 
 	"google.golang.org/protobuf/proto"
 
-	"github.com/urnetwork/connect/v2026/protocol"
+	"github.com/urnetwork/connect/protocol"
 )
 
 // buildEquivalentTransferFrame builds the protocol.TransferFrame that

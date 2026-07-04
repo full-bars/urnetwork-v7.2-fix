@@ -6,7 +6,7 @@ import (
 	"net"
 	"testing"
 
-	"github.com/urnetwork/connect/v2026/protocol"
+	"github.com/urnetwork/connect/protocol"
 )
 
 func cfaaVerdictName(v cfaaVerdict) string {

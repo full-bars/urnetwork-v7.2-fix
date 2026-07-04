@@ -7,7 +7,7 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/urnetwork/connect/v2026/protocol"
+	"github.com/urnetwork/connect/protocol"
 )
 
 const MaxMultihopLength = 8

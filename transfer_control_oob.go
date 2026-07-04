@@ -5,7 +5,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/urnetwork/connect/v2026/protocol"
+	"github.com/urnetwork/connect/protocol"
 )
 
 // ControlSyncOob is like ControlSync, but delivers control messages via the

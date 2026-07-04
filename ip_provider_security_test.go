@@ -9,7 +9,7 @@ import (
 	"github.com/google/gopacket"
 	"github.com/google/gopacket/layers"
 
-	"github.com/urnetwork/connect/v2026/protocol"
+	"github.com/urnetwork/connect/protocol"
 )
 
 // TestRemoteUserNatProviderEnforcesReversedPolicy pins the provider (exit) role's

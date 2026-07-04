@@ -6,7 +6,7 @@ import (
 	"io"
 	"math"
 	// "time"
-	// "github.com/urnetwork/connect/v2026"
+	// "github.com/urnetwork/connect"
 )
 
 // a message framer that optimizes memory copies to reduce cpu+memory usage

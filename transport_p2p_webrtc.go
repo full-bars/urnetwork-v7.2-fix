@@ -17,7 +17,7 @@ import (
 	"github.com/pion/logging"
 	"github.com/pion/webrtc/v4"
 
-	"github.com/urnetwork/connect/v2026/protocol"
+	"github.com/urnetwork/connect/protocol"
 )
 
 type WebRtcConn interface {

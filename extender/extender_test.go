@@ -16,7 +16,7 @@ import (
 
 	"github.com/go-playground/assert/v2"
 
-	"github.com/urnetwork/connect/v2026"
+	"github.com/urnetwork/connect"
 )
 
 func TestExtender(t *testing.T) {

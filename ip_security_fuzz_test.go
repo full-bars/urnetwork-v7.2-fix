@@ -6,7 +6,7 @@ import (
 	"net"
 	"testing"
 
-	"github.com/urnetwork/connect/v2026/protocol"
+	"github.com/urnetwork/connect/protocol"
 )
 
 // fuzzIpv4Packet hand-rolls a minimal IPv4 packet (no options, no checksum — the

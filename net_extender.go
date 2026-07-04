@@ -46,7 +46,7 @@ import (
 
 	// "src.agwa.name/tlshacks"
 
-	"github.com/urnetwork/connect/v2026/protocol"
+	"github.com/urnetwork/connect/protocol"
 )
 
 // an extender uses an independent url that is hard-coded to forward to the platform

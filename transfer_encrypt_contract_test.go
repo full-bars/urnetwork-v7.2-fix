@@ -7,7 +7,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/urnetwork/connect/v2026/protocol"
+	"github.com/urnetwork/connect/protocol"
 )
 
 // grantingClientOob is a test ClientOob that answers CreateContract requests

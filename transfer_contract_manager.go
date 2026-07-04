@@ -19,7 +19,7 @@ import (
 
 	// "google.golang.org/protobuf/proto"
 
-	"github.com/urnetwork/connect/v2026/protocol"
+	"github.com/urnetwork/connect/protocol"
 )
 
 // manage contracts which are embedded into each transfer sequence

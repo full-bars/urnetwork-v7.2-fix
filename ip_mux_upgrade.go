@@ -16,7 +16,7 @@ import (
 
 	"golang.org/x/net/dns/dnsmessage"
 
-	"github.com/urnetwork/connect/v2026/protocol"
+	"github.com/urnetwork/connect/protocol"
 )
 
 // HttpUpgradeMode selects how intercepted plaintext HTTP (TCP/80) is handled: passed through to

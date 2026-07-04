@@ -24,7 +24,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/urnetwork/connect/v2026/protocol"
+	"github.com/urnetwork/connect/protocol"
 )
 
 // IpMuxSend matches the UserNat send signature.

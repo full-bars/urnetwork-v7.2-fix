@@ -6,7 +6,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/urnetwork/connect/v2026/protocol"
+	"github.com/urnetwork/connect/protocol"
 )
 
 // TestDmcaEvictThenResumeMidStreamNotDropped pins the TTL-eviction user-visible edge:

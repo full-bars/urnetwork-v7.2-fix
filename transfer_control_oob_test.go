@@ -9,7 +9,7 @@ import (
 
 	"github.com/go-playground/assert/v2"
 
-	"github.com/urnetwork/connect/v2026/protocol"
+	"github.com/urnetwork/connect/protocol"
 )
 
 // testOobControl is a mock OutOfBandControl: it fails the first `failUntil`

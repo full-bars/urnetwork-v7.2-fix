@@ -7,7 +7,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/urnetwork/connect/v2026/protocol"
+	"github.com/urnetwork/connect/protocol"
 )
 
 // a recorder for sent (upstream) and received (downstream) packets

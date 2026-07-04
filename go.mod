@@ -1,4 +1,4 @@
-module github.com/urnetwork/connect/v2026
+module github.com/urnetwork/connect
 
 go 1.26.3
 

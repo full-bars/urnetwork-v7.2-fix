@@ -19,7 +19,7 @@ import (
 
 	"google.golang.org/protobuf/proto"
 
-	"github.com/urnetwork/connect/v2026/protocol"
+	"github.com/urnetwork/connect/protocol"
 )
 
 // multi client is a sender approach to mitigate bad destinations

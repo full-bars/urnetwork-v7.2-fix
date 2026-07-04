@@ -13,7 +13,7 @@ import (
 
 	// "github.com/urnetwork/glog/v2026"
 
-	"github.com/urnetwork/connect/v2026/protocol"
+	"github.com/urnetwork/connect/protocol"
 )
 
 type MultiClientGeneratorClientArgs struct {
