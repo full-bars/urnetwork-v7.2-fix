@@ -9,6 +9,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	// "net"
 	mathrand "math/rand"
 	"net/http"
@@ -346,49 +347,53 @@ func runHealthHeartbeat(ctx context.Context, startTime time.Time, profile string
 	}
 }
 
-func runOutageWatcher(ctx context.Context, nodeName string, envWebhookURL string) {
+func runOutageWatcher(ctx context.Context, nodeName, envWebhookURL string) {
 	const pollInterval = 30 * time.Second
 	const cooldown = 5 * time.Minute
 	const clearConfirm = 2
-	const startConfirm = 10
+	const startConfirm = 10 // 10 * 30s = 5 minutes of continuous degradation
+
 	degraded := false
 	degradedCount := 0
 	clearCount := 0
 	var lastStartFire, lastClearFire time.Time
+
 	webhookURL := resolveAlertWebhook(envWebhookURL)
 	if webhookURL != "" {
-		tlog("[outage] watcher active node=%s webhook=configured
-", nodeName)
+		tlog("[outage] watcher active node=%s webhook=configured\n", nodeName)
 	} else {
-		tlog("[outage] watcher active node=%s
-", nodeName)
+		tlog("[outage] watcher active node=%s\n", nodeName)
 	}
+
 	ticker := time.NewTicker(pollInterval)
 	defer ticker.Stop()
+
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
 		}
+
+		// Re-resolve every tick so writing ~/.urnetwork/alert_webhook can
+		// turn outage alerting on, off, or repoint it without a restart —
+		// same reasoning as the hub report URL in bandwidth_reporter.go.
 		if resolved := resolveAlertWebhook(envWebhookURL); resolved != webhookURL {
 			webhookURL = resolved
 			if webhookURL != "" {
-				tlog("[outage] webhook updated node=%s webhook=configured
-", nodeName)
+				tlog("[outage] webhook updated node=%s webhook=configured\n", nodeName)
 			} else {
-				tlog("[outage] webhook disabled node=%s
-", nodeName)
+				tlog("[outage] webhook disabled node=%s\n", nodeName)
 			}
 		}
+
 		if connect.IsBackendDegraded() {
 			clearCount = 0
 			if !degraded {
 				degradedCount++
 				if degradedCount >= startConfirm {
 					degraded = true
-					tlog("[outage] backend degraded — holding existing connections, not accepting new ones
-")
+					tlog("[outage] backend degraded — holding existing connections, not accepting new ones\n")
 					if webhookURL != "" && time.Since(lastStartFire) >= cooldown {
 						lastStartFire = time.Now()
 						go fireWebhook(webhookURL, nodeName, "outage_start",
@@ -403,8 +408,7 @@ func runOutageWatcher(ctx context.Context, nodeName string, envWebhookURL string
 				if clearCount >= clearConfirm {
 					degraded = false
 					clearCount = 0
-					tlog("[outage] backend recovered
-")
+					tlog("[outage] backend recovered\n")
 					if webhookURL != "" && time.Since(lastClearFire) >= cooldown {
 						lastClearFire = time.Now()
 						go fireWebhook(webhookURL, nodeName, "outage_clear", "Backend connectivity restored.")
@@ -1893,6 +1897,9 @@ func runProfitHeartbeat(ctx context.Context) {
 }
 
 func fireWebhook(url, nodeName, event, message string) {
+	// Format the body per service. Discord requires "content" and Slack requires
+	// "text"; a generic {event,node,...} body is rejected by both (HTTP 400). Any
+	// other endpoint (ntfy, custom) gets the structured JSON it can parse.
 	var payload []byte
 	var err error
 	switch {
@@ -1911,18 +1918,21 @@ func fireWebhook(url, nodeName, event, message string) {
 		})
 	}
 	if err != nil {
-		tlog("[webhook] marshal failed: %v
-", err)
+		tlog("[webhook] marshal failed: %v\n", err)
 		return
 	}
 	resp, err := webhookClient.Post(url, "application/json", bytes.NewReader(payload))
 	if err != nil {
-		tlog("[webhook] POST failed: %v
-", err)
+		tlog("[webhook] delivery failed (%s): %v\n", event, err)
 		return
 	}
-	resp.Body.Close()
+	defer resp.Body.Close()
+	io.Copy(io.Discard, resp.Body)
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		tlog("[webhook] non-2xx response (%s): %d\n", event, resp.StatusCode)
+	}
 }
+
 
 func paceMonitor(ctx context.Context) {
 	ticker := time.NewTicker(30 * time.Second)
@@ -1940,16 +1950,35 @@ func paceMonitor(ctx context.Context) {
 		}
 		pct := float64(up) * 100 / float64(total)
 		connectingN := len(connecting)
-		if up*100/total > 90 && connectingN < 5 {
+		elapsed := time.Since(provideStartTime)
+		if elapsed > 60*time.Minute {
+			tlog("🔥 [pace] warmup: %d/%d up (%.0f%%), %d connecting — forced done after 60m\n",
+				up, total, pct, connectingN)
 			proxyWarmupDone.Store(true)
+			if reloadPath, err := proxyReloadPath(); err == nil {
+				if err := writeReloadTrigger(reloadPath); err != nil {
+					tlog("[proxy] warn: reload trigger write failed: %v\n", err)
+				}
+			}
 			return
 		}
-		if connectingN > 10 && pct < 50 {
-			tlog("⚠ [pace] warmup: %d/%d up (%.0f%%), %d connecting
-", up, total, pct, connectingN)
+		if pct < 50 && connectingN > 10 {
+			tlog("🔥 [pace] ⚠ warmup: %d/%d up (%.0f%%), %d connecting, %d done\n",
+				up, total, pct, connectingN, total-up-connectingN)
+		} else if pct > 90 && connectingN < 5 {
+			tlog("🔥 [pace] ✓ warmup: %d/%d up (%.0f%%), %d connecting — done\n",
+				up, total, pct, connectingN)
+			proxyWarmupDone.Store(true)
+			if reloadPath, err := proxyReloadPath(); err == nil {
+				if err := writeReloadTrigger(reloadPath); err != nil {
+					tlog("[proxy] warn: reload trigger write failed: %v\n", err)
+				}
+			}
+			return // warmup complete — stop repeating
 		} else {
-			tlog("[pace] warmup: %d/%d up (%.0f%%), %d connecting
-", up, total, pct, connectingN)
+			tlog("🔥 [pace] warmup: %d/%d up (%.0f%%), %d connecting\n",
+				up, total, pct, connectingN)
 		}
 	}
 }
+
