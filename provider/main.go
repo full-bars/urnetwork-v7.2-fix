@@ -1331,6 +1331,13 @@ func writeProxyConfig(proxyConfig *ProxyConfig) {
 	urNetworkDir := filepath.Join(home, ".urnetwork")
 	proxyPath := filepath.Join(urNetworkDir, "proxy")
 
+	if _, err := os.Stat(urNetworkDir); os.IsNotExist(err) {
+		err = os.MkdirAll(urNetworkDir, 0700)
+		if err != nil {
+			panic(err)
+		}
+	}
+
 	b, err := json.Marshal(proxyConfig)
 	if err != nil {
 		panic(err)
