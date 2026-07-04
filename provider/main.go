@@ -8,6 +8,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	// "net"
 	mathrand "math/rand"
 	"net/http"
@@ -2020,3 +2021,833 @@ func RunStartupAudit() (slowDisk bool, lowSpace bool) {
 	return connect.RunSystemAudit(skipDisk)
 }
 
+func activitySnapshot(shmLog string) {
+	// Single snapshot for non-interactive use
+	healthDir, ok := proxyHealthDir()
+	if !ok {
+		return
+	}
+
+	up, degraded := 0, 0
+	if data, err := os.ReadFile(filepath.Join(healthDir, "proxy_health.state")); err == nil {
+		var down, dead int
+		for _, line := range strings.Split(string(data), "\n") {
+			if strings.HasPrefix(line, " Up:") {
+				fmt.Sscanf(line, " Up: %d | Down: %d | Dead: %d | Degraded: %d", &up, &down, &dead, &degraded)
+			}
+		}
+	}
+	fmt.Printf("Up: %d | Degraded: %d\n", up, degraded)
+
+	if data, err := os.ReadFile(filepath.Join(healthDir, "proxy_traffic.state")); err == nil {
+		fmt.Println(string(data))
+	}
+}
+
+func classifyHealth(e ProxyEntry) string {
+	if e.Health != "" {
+		return e.Health
+	}
+	return "starting"
+}
+
+func providerLogs(opts docopt.Opts) {
+	n, _ := opts.Int("-n")
+	out, err := readSHMLog(shmLogPath, n)
+	if err != nil {
+		shmLogFatal(40, "no ramlogs found at %s — is URNETWORK_RAMLOGS=1 set?", shmLogPath)
+	}
+	fmt.Print(out)
+
+	// Tail: follow the file from current position.
+	f, err := os.Open(shmLogPath)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "error: could not open log for tailing: %v\n", err)
+		return
+	}
+	if _, err := f.Seek(0, io.SeekEnd); err != nil {
+		f.Close()
+		fmt.Fprintf(os.Stderr, "error: seek failed: %v\n", err)
+		return
+	}
+
+	buf := make([]byte, 4096)
+	for {
+		nr, readErr := f.Read(buf)
+		if nr > 0 {
+			os.Stdout.Write(buf[:nr])
+		}
+		if readErr != nil && readErr != io.EOF {
+			f.Close()
+			fmt.Fprintf(os.Stderr, "error: read failed: %v\n", readErr)
+			return
+		}
+		if readErr == io.EOF {
+			// Detect ramlogs wrap: if the file shrunk behind our position, reopen from start.
+			if pos, _ := f.Seek(0, io.SeekCurrent); pos > 0 {
+				if fi, statErr := f.Stat(); statErr == nil && fi.Size() < pos {
+					f.Close()
+					newF, openErr := os.Open(shmLogPath)
+					if openErr != nil {
+						fmt.Fprintf(os.Stderr, "error: could not reopen log after wrap: %v\n", openErr)
+						return
+					}
+					f = newF
+				}
+			}
+			time.Sleep(200 * time.Millisecond)
+		}
+	}
+}
+
+func proxyActivity() {
+	shmLog := os.Getenv("URNETWORK_SHM_LOG")
+	if shmLog == "" {
+		shmLog = "/dev/shm/urnetwork.log"
+	}
+
+	statePath, err := proxyStatePath()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "error: could not determine state path: %v\n", err)
+		return
+	}
+
+	_ = statePath
+	_ = shmLog
+
+	fmt.Println("Proxy Activity Monitor")
+	fmt.Println("Press Ctrl+C to exit")
+	fmt.Println()
+
+	// Use terminal directly for live updates
+	oldState, err := term.MakeRaw(int(os.Stdin.Fd()))
+	if err != nil {
+		// Non-interactive: just take one snapshot
+		activitySnapshot(shmLog)
+		return
+	}
+	defer term.Restore(int(os.Stdin.Fd()), oldState)
+
+	reader := bufio.NewReader(os.Stdin)
+	ticker := time.NewTicker(1 * time.Second)
+	defer ticker.Stop()
+
+	done := make(chan struct{})
+	go func() {
+		for {
+			b, _ := reader.ReadByte()
+			if b == 'q' || b == 0x03 {
+				close(done)
+				return
+			}
+		}
+	}()
+
+	fmt.Print("\033[?25l") // hide cursor
+	defer fmt.Print("\033[?25h") // show cursor
+
+	// Scroll window tracking recent contract events
+	const maxEvents = 20
+	var recentContracts []string
+	var contractMu sync.Mutex
+
+	// Goroutine to tail the log for contract events
+	go func() {
+		f, err := os.Open(shmLog)
+		if err != nil {
+			return
+		}
+		defer f.Close()
+
+		// Seek to end
+		_, _ = f.Seek(0, io.SeekEnd)
+
+		buf := make([]byte, 4096)
+		for {
+			select {
+			case <-done:
+				return
+			default:
+			}
+			n, err := f.Read(buf)
+			if err != nil || n == 0 {
+				time.Sleep(200 * time.Millisecond)
+				continue
+			}
+			lines := strings.Split(string(buf[:n]), "\n")
+			for _, line := range lines {
+				if strings.Contains(line, "[contract] acquired") || strings.Contains(line, "[contract] acquired") {
+					// Extract timestamp and message
+					if idx := strings.Index(line, "[contract]"); idx >= 0 {
+						ts := ""
+						if len(line) > 19 {
+							ts = strings.TrimSpace(line[:19])
+						}
+						contractMu.Lock()
+						recentContracts = append(recentContracts, fmt.Sprintf("%s %s", ts, line[idx:]))
+						if len(recentContracts) > maxEvents {
+							recentContracts = recentContracts[1:]
+						}
+						contractMu.Unlock()
+					}
+				}
+			}
+		}
+	}()
+
+	for {
+		select {
+		case <-done:
+			return
+		case <-ticker.C:
+		}
+
+		// Read health state for up/down counts
+		up, connecting, degraded := 0, 0, 0
+		healthDir, ok := proxyHealthDir()
+		var activeProxies []string
+		if ok {
+			if data, err := os.ReadFile(filepath.Join(healthDir, "proxy_health.state")); err == nil {
+				for _, line := range strings.Split(string(data), "\n") {
+					if strings.HasPrefix(line, " Up:") {
+						var down, dead int
+						fmt.Sscanf(line, " Up: %d | Down: %d | Dead: %d | Degraded: %d", &up, &down, &dead, &degraded)
+					}
+					if strings.Contains(line, " RECOVERED ") || strings.Contains(line, " DEGRADED ") {
+						activeProxies = append(activeProxies, line)
+					}
+				}
+			}
+		}
+
+		// Parse traffic state for active proxies
+		type activeProxy struct {
+			id      string
+			addr    string
+			rx      string
+			tx      string
+			clients int
+			age     string
+			bill    string
+		}
+		var active []activeProxy
+		if ok {
+			if data, err := os.ReadFile(filepath.Join(healthDir, "proxy_traffic.state")); err == nil {
+				lines := strings.Split(string(data), "\n")
+				for _, line := range lines {
+					if !strings.Contains(line, "proxy[") || strings.Contains(line, "PROXY ID") {
+						continue
+					}
+					// Parse: | proxy[42] | 1.2.3.4:1080 | 2 | 5m | 10 MB / 20 MB | 100 MB / 200 MB |
+					parts := strings.Split(line, "|")
+					if len(parts) >= 6 {
+						id := strings.TrimSpace(parts[1])
+						addr := strings.TrimSpace(parts[2])
+						clientsStr := strings.TrimSpace(parts[3])
+						age := strings.TrimSpace(parts[4])
+						bill := strings.TrimSpace(parts[5])
+						total := strings.TrimSpace(parts[6])
+
+						var cl int
+						fmt.Sscanf(clientsStr, "%d", &cl)
+						if cl > 0 {
+							active = append(active, activeProxy{
+								id: id, addr: addr, clients: cl,
+								age: age, bill: bill, rx: total, tx: total,
+							})
+						}
+					}
+				}
+			}
+		}
+
+		// Build output
+		var out strings.Builder
+
+		// Header
+		out.WriteString("\033[H\033[J") // clear screen
+		now := time.Now()
+		out.WriteString(fmt.Sprintf("Proxy Activity — %s (refreshing every 1s)\n", now.Format(time.RFC3339)))
+		out.WriteString(fmt.Sprintf("Up: %d | Degraded: %d | Connecting: %d\n", up, degraded, connecting))
+		out.WriteString(fmt.Sprintf("Active proxies with clients: %d\n", len(active)))
+		out.WriteString("\n")
+
+		// Active proxies table
+		if len(active) > 0 {
+			out.WriteString(fmt.Sprintf("%-18s %-22s %9s %9s %5s  %s\n", "PROXY", "ADDRESS", "RX", "TX", "CLI", "AGE"))
+			out.WriteString(strings.Repeat("-", 70) + "\n")
+			for _, p := range active {
+				out.WriteString(fmt.Sprintf("%-18s %-22s %9s %9s %5d  %s\n",
+					p.id, p.addr, p.rx, p.tx, p.clients, p.age))
+			}
+		} else {
+			out.WriteString("No proxies with active clients.\n")
+		}
+
+		// Recent contracts
+		contractMu.Lock()
+		if len(recentContracts) > 0 {
+			out.WriteString(fmt.Sprintf("\nRecent Contracts:\n"))
+			start := len(recentContracts) - 10
+			if start < 0 {
+				start = 0
+			}
+			for _, c := range recentContracts[start:] {
+				out.WriteString("  " + c + "\n")
+			}
+		}
+		contractMu.Unlock()
+
+		out.WriteString("\n[q] quit\n")
+		fmt.Print(out.String())
+	}
+}
+
+func proxyAddSource(opts docopt.Opts) {
+	url, _ := opts.String("<url>")
+	url = strings.TrimSpace(url)
+	if url == "" {
+		shmLogFatal(70, "no URL provided")
+	}
+
+	release, err := acquireProxyLock()
+	if err != nil {
+		shmLogFatal(71, "could not acquire proxy lock: %v", err)
+	}
+
+	state, err := readProxyURLState()
+	if err != nil {
+		release()
+		shmLogFatal(72, "could not read proxy_url.json: %v", err)
+	}
+	for _, existing := range state.Sources {
+		if existing == url {
+			release()
+			fmt.Printf("source already added: %s\n", url)
+			return
+		}
+	}
+	state.Sources = append(state.Sources, url)
+	if err := writeProxyURLState(state); err != nil {
+		release()
+		shmLogFatal(73, "could not write proxy_url.json: %v", err)
+	}
+	release()
+
+	fmt.Printf("added source: %s\nfetching now...\n", url)
+	// maxTotal=0 here: the cap configured for the running provide() process
+	// (--proxy_url_max) applies to its own background fetcher, not to this
+	// one-shot CLI fetch. The next scheduled fetch will resume honoring it.
+	fetchAndMergeProxyURLs(context.Background(), []string{url}, 0, defaultAPIHost, defaultAPIPort)
+	fmt.Println("done.")
+}
+
+func proxyExclude(opts docopt.Opts) {
+	pattern, _ := opts.String("<pattern>")
+	removeFlag, _ := opts.Bool("--remove")
+
+	urlState, err := readProxyURLState()
+	if err != nil {
+		fmt.Printf("could not read proxy_url.json: %v\n", err)
+		return
+	}
+
+	if pattern == "" {
+		if removeFlag {
+			fmt.Println("usage: proxy exclude <pattern> --remove")
+			return
+		}
+		if len(urlState.ExcludePatterns) == 0 {
+			fmt.Println("no exclude patterns set")
+			return
+		}
+		fmt.Printf("%d exclude patterns (URL fetches skip matching hosts):\n", len(urlState.ExcludePatterns))
+		for _, p := range urlState.ExcludePatterns {
+			fmt.Printf("    %s\n", p)
+		}
+		return
+	}
+
+	if removeFlag {
+		if !removeExcludePattern(urlState, pattern) {
+			fmt.Printf("pattern %q is not in the exclude list\n", pattern)
+			if len(urlState.ExcludePatterns) > 0 {
+				fmt.Printf("current patterns: %s\n", strings.Join(urlState.ExcludePatterns, ", "))
+			}
+			return
+		}
+		if err := writeProxyURLState(urlState); err != nil {
+			fmt.Printf("could not write proxy_url.json: %v\n", err)
+			return
+		}
+		fmt.Printf("removed exclude pattern %q — matching proxies may return on the next URL fetch\n", pattern)
+		return
+	}
+
+	if !addExcludePattern(urlState, pattern) {
+		fmt.Printf("pattern %q is already excluded\n", pattern)
+		return
+	}
+	if err := writeProxyURLState(urlState); err != nil {
+		fmt.Printf("could not write proxy_url.json: %v\n", err)
+		return
+	}
+	fmt.Printf("added exclude pattern %q — future URL fetches will skip matching hosts\n", pattern)
+	fmt.Println("note: already-cached/running proxies are not removed; use 'proxy remove --match' for that")
+}
+
+
+func proxyRefresh(opts docopt.Opts) {
+	force, _ := opts.Bool("--force")
+
+	state, err := readProxyState()
+	if err != nil {
+		shmLogFatal(50, "could not read proxy.state (use 'provider proxy add/remove' to edit the proxy list for next startup)")
+	}
+
+	if state.StartedAt.IsZero() {
+		shmLogFatal(51, "provider does not appear to be running (use 'provider proxy add/remove' to edit the proxy list for next startup)")
+	}
+
+	uptime := time.Since(state.StartedAt)
+
+	const warmupThreshold = 8 * time.Hour
+	if uptime < warmupThreshold && !force {
+		shmLogFatal(52, "provider has only been running %s — proxies need 8-12h to warm up; use --force to override", formatDuration(uptime))
+	}
+
+	release, err := acquireProxyLock()
+	if err != nil {
+		shmLogFatal(53, "could not acquire proxy lock: %v", err)
+	}
+	defer release()
+
+	var desired []*connect.ProxySettings
+	if state.Source != "" {
+		settings, err := readProxySettingsFromFile(state.Source)
+		if err != nil {
+			shmLogFatal(54, "could not read proxy file %s: %v", state.Source, err)
+		}
+		desired = settings
+	} else {
+		desired = readProxySettings()
+	}
+
+	// Diff
+	desiredSet := map[string]bool{}
+	for _, s := range desired {
+		desiredSet[s.Address] = true
+	}
+
+	currentSet := map[string]ProxyEntry{}
+	for addr, e := range state.Proxies {
+		currentSet[addr] = e
+	}
+
+	var added []string
+	for _, s := range desired {
+		if _, ok := currentSet[s.Address]; !ok {
+			added = append(added, s.Address)
+		}
+	}
+
+	type removedProxy struct {
+		addr  string
+		entry ProxyEntry
+	}
+	var removed []removedProxy
+	for addr, e := range currentSet {
+		if !desiredSet[addr] {
+			e.Health = classifyHealth(e)
+			removed = append(removed, removedProxy{addr: addr, entry: e})
+		}
+	}
+
+	if len(added) == 0 && len(removed) == 0 {
+		fmt.Println("proxy list is already up to date. Nothing to do.")
+		return
+	}
+
+	// Warn if all proxies would be removed — the provider exits when the last proxy goroutine stops.
+	if len(removed) == len(currentSet) && len(added) == 0 {
+		fmt.Printf("WARNING: This will remove ALL proxies. The provider process will exit once the\n")
+		fmt.Printf("last proxy goroutine stops. Restart with a proxy list to resume providing.\n\n")
+	}
+
+	// Print diff
+	fmt.Printf("proxy refresh: %d proxies will be removed, %d will be added.\n\n", len(removed), len(added))
+	if len(removed) > 0 {
+		fmt.Println("  Removing:")
+		for _, rp := range removed {
+			fmt.Printf("    proxy[%d]  %s   — %s\n", rp.entry.ID, rp.addr, rp.entry.Health)
+		}
+	}
+	if len(added) > 0 {
+		fmt.Println("\n  Adding:")
+		for _, addr := range added {
+			fmt.Printf("    %s\n", addr)
+		}
+	}
+
+	// Check for high-risk removals: up, recently_offline, offline, long_offline all have
+	// significant warm state. dead and inactive are low-risk (single confirmation).
+	highRisk := false
+	for _, rp := range removed {
+		switch rp.entry.Health {
+		case "up", "recently_offline", "offline", "long_offline":
+			highRisk = true
+		}
+		if highRisk {
+			break
+		}
+	}
+
+	if highRisk {
+		fmt.Printf("\nWARNING: One or more proxies being removed are online or have recent warm state.\n")
+		if !confirm("Remove them anyway?") {
+			fmt.Println("Aborted.")
+			return
+		}
+		if !confirm("Are you sure? This may interrupt live traffic.") {
+			fmt.Println("Aborted.")
+			return
+		}
+	} else {
+		if !confirm("Proceed?") {
+			fmt.Println("Aborted.")
+			return
+		}
+	}
+
+	reloadPath, err := proxyReloadPath()
+	if err != nil {
+		shmLogFatal(55, "could not determine reload path: %v", err)
+	}
+
+	if err := writeReloadTrigger(reloadPath); err != nil {
+		shmLogFatal(56, "could not write reload trigger: %v", err)
+	}
+
+	fmt.Println("Reload triggered. Provider will apply changes within 2 seconds.")
+}
+
+func proxyRemoveDead(opts docopt.Opts) {
+	state, err := readProxyState()
+	if err != nil || state.StartedAt.IsZero() {
+		shmLogFatal(60, "provider does not appear to be running")
+	}
+
+	uptime := time.Since(state.StartedAt)
+	const deadConfirmDelay = 65 * time.Minute
+	if uptime < deadConfirmDelay {
+		shmLogFatal(61, "provider has only been running %s — need %s uptime before dead status is confirmed", formatDuration(uptime), formatDuration(deadConfirmDelay))
+	}
+
+	// Parse options
+	autoYes, _ := opts.Bool("--yes")
+	preview, _ := opts.Bool("--preview")
+
+	degradedDur := time.Duration(0)
+	degradedFlag, _ := opts.Bool("--degraded")
+	degVal, _ := opts.String("--degraded")
+	if degradedFlag || degVal != "" {
+		if degVal == "" || degVal == "true" {
+			degradedDur = 24 * time.Hour // default: remove degraded > 24h
+		} else {
+			if d, err := time.ParseDuration(degVal); err == nil {
+				degradedDur = d
+			} else {
+				fmt.Printf("invalid duration %q for --degraded (e.g. --degraded=24h)\n", degVal)
+				return
+			}
+		}
+	}
+
+	var sourceFilter string
+	if s, _ := opts.String("--source"); s != "" {
+		if s != "url" && s != "file" && s != "internal" {
+			fmt.Printf("invalid source %q (use 'url', 'file', or 'internal')\n", s)
+			return
+		}
+		sourceFilter = s
+	}
+
+	type removedProxy struct {
+		addr  string
+		entry ProxyEntry
+	}
+
+	// Collect candidates by category
+	var dead, inactive, degraded []removedProxy
+	for addr, e := range state.Proxies {
+		// Apply source filter
+		effectiveSource := e.Source
+		if effectiveSource == "" {
+			if state.Source != "" {
+				effectiveSource = "file"
+			} else {
+				effectiveSource = "internal"
+			}
+		}
+		if sourceFilter != "" && effectiveSource != sourceFilter {
+			continue
+		}
+
+		switch e.Health {
+		case "dead":
+			dead = append(dead, removedProxy{addr: addr, entry: e})
+		case "inactive":
+			inactive = append(inactive, removedProxy{addr: addr, entry: e})
+		case "recently_offline", "offline", "long_offline":
+			if degradedDur > 0 {
+				ds, err := time.Parse(time.RFC3339, e.DownSince)
+				if err != nil || time.Since(ds) < degradedDur {
+					continue
+				}
+			}
+			degraded = append(degraded, removedProxy{addr: addr, entry: e})
+		}
+	}
+
+	if len(dead) == 0 && len(inactive) == 0 && len(degraded) == 0 {
+		fmt.Println("Nothing to remove.")
+		return
+	}
+
+	printCategory := func(label string, items []removedProxy) {
+		if len(items) == 0 {
+			return
+		}
+		sourceStr := ""
+		if sourceFilter != "" {
+			sourceStr = fmt.Sprintf(" [source=%s]", sourceFilter)
+		}
+		fmt.Printf("  %d %s%s:\n", len(items), label, sourceStr)
+		for _, rp := range items {
+			ts := ""
+			if rp.entry.DownSince != "" {
+				if t, err := time.Parse(time.RFC3339, rp.entry.DownSince); err == nil {
+					ts = fmt.Sprintf(" down_since=%s", formatDuration(time.Since(t).Truncate(time.Second)))
+				}
+			}
+			fmt.Printf("    proxy[%d]  %s%s\n", rp.entry.ID, rp.addr, ts)
+		}
+		fmt.Println()
+	}
+
+	if preview {
+		fmt.Println("=== PREVIEW (no changes will be made) ===")
+		printCategory("dead", dead)
+		printCategory("inactive", inactive)
+		printCategory(fmt.Sprintf("degraded (offline > %s)", formatDuration(degradedDur)), degraded)
+		total := len(dead) + len(inactive) + len(degraded)
+		fmt.Printf("Would remove %d proxies total.\n", total)
+		return
+	}
+
+	var toRemove []removedProxy
+
+	if len(dead) > 0 {
+		printCategory("dead", dead)
+		if autoYes || confirm(fmt.Sprintf("Remove %d dead proxies?", len(dead))) {
+			toRemove = append(toRemove, dead...)
+		}
+	}
+
+	if len(inactive) > 0 {
+		printCategory("inactive", inactive)
+		if autoYes || confirm(fmt.Sprintf("Remove %d inactive proxies?", len(inactive))) {
+			toRemove = append(toRemove, inactive...)
+		}
+	}
+
+	if len(degraded) > 0 {
+		printCategory(fmt.Sprintf("degraded (offline > %s)", formatDuration(degradedDur)), degraded)
+		if autoYes || confirm(fmt.Sprintf("Remove %d degraded proxies?", len(degraded))) {
+			toRemove = append(toRemove, degraded...)
+		}
+	}
+
+	if len(toRemove) == 0 {
+		fmt.Println("Nothing to remove.")
+		return
+	}
+
+	addrsBySource := map[string][]string{}
+	for _, rp := range toRemove {
+		source := rp.entry.Source
+		if source == "" {
+			if state.Source != "" {
+				source = "file"
+			} else {
+				source = "internal"
+			}
+		}
+		addrsBySource[source] = append(addrsBySource[source], rp.addr)
+	}
+
+	if err := removeDeadProxies(state, addrsBySource); err != nil {
+		shmLogFatal(62, "%v", err)
+	}
+
+	fmt.Printf("Removed %d proxies. Reload triggered.\n", len(toRemove))
+}
+
+func proxyRemoveSource(opts docopt.Opts) {
+	url, _ := opts.String("<url>")
+	url = strings.TrimSpace(url)
+
+	release, err := acquireProxyLock()
+	if err != nil {
+		shmLogFatal(75, "could not acquire proxy lock: %v", err)
+	}
+	defer release()
+
+	state, err := readProxyURLState()
+	if err != nil {
+		shmLogFatal(76, "could not read proxy_url.json: %v", err)
+	}
+
+	kept := make([]string, 0, len(state.Sources))
+	found := false
+	for _, existing := range state.Sources {
+		if existing == url {
+			found = true
+			continue
+		}
+		kept = append(kept, existing)
+	}
+	if !found {
+		fmt.Printf("source not found: %s\n", url)
+		return
+	}
+
+	state.Sources = kept
+	if err := writeProxyURLState(state); err != nil {
+		shmLogFatal(74, "could not write proxy_url.json: %v", err)
+	}
+	fmt.Printf("removed source: %s\n", url)
+	fmt.Println("note: previously fetched proxies from this source remain running; use 'proxy remove-dead' to prune any that go dead.")
+}
+
+func proxySummary() {
+	state, _ := readProxyState()
+
+	up, dead, degraded, connecting := 0, 0, 0, 0
+	if healthDir, ok := proxyHealthDir(); ok {
+		if data, err := os.ReadFile(filepath.Join(healthDir, "proxy_health.state")); err == nil {
+			for _, line := range strings.Split(string(data), "\n") {
+				if strings.HasPrefix(line, " Up:") {
+						var down int
+					fmt.Sscanf(line, " Up: %d | Down: %d | Dead: %d | Degraded: %d", &up, &down, &dead, &degraded)
+				}
+			}
+		}
+	}
+	fileCount := 0
+	urlCount := 0
+	internalCount := 0
+	total := 0
+	if state != nil {
+		total = len(state.Proxies)
+		for _, e := range state.Proxies {
+			switch e.Source {
+			case "url":
+				urlCount++
+			case "file":
+				fileCount++
+			case "internal":
+				internalCount++
+			default:
+				if state.Source != "" {
+					fileCount++
+				} else {
+					internalCount++
+				}
+			}
+		}
+		connecting = total - up - dead - degraded
+		if connecting < 0 {
+			connecting = 0
+		}
+	}
+
+	urlState, _ := readProxyURLState()
+	urlSources := 0
+	urlCached := 0
+	urlBlacklisted := 0
+	if urlState != nil {
+		urlSources = len(urlState.Sources)
+		urlCached = len(urlState.Cache)
+		urlBlacklisted = len(urlState.Blacklist)
+	}
+
+	healthDir, _ := proxyHealthDir()
+
+	fmt.Println("=========================================================================")
+	fmt.Println(" PROXY SUMMARY")
+	fmt.Printf(" Updated: %s\n", time.Now().UTC().Format(time.RFC3339))
+	fmt.Println("=========================================================================")
+	fmt.Println()
+	fmt.Printf("  Total proxies:      %d\n", total)
+	fmt.Printf("  Up:                 %d\n", up)
+	fmt.Printf("  Connecting:         %d\n", connecting)
+	fmt.Printf("  Degraded:           %d\n", degraded)
+	fmt.Printf("  Dead:               %d\n", dead)
+	fmt.Println()
+	fmt.Println(" --- Sources ---")
+	fileSource := "(internal)"
+	if state != nil && state.Source != "" {
+		fileSource = state.Source
+	}
+	fmt.Printf("  File proxies:       %d  (%s)\n", fileCount, fileSource)
+	fmt.Printf("  URL proxies:        %d\n", urlCount)
+	fmt.Printf("  Internal proxies:   %d\n", internalCount)
+	fmt.Println()
+	fmt.Println(" --- URL Sources ---")
+	fmt.Printf("  Source URLs:        %d\n", urlSources)
+	fmt.Printf("  Cached addresses:   %d\n", urlCached)
+	fmt.Printf("  Blacklisted:        %d\n", urlBlacklisted)
+	if len(urlState.ExcludePatterns) > 0 {
+		fmt.Printf("  Exclude patterns:   %s\n", strings.Join(urlState.ExcludePatterns, ", "))
+	}
+	if urlSources > 0 {
+		fmt.Println()
+		for _, s := range urlState.Sources {
+			fmt.Printf("    %s\n", s)
+		}
+	}
+	fmt.Println()
+	if state != nil {
+		fmt.Printf("  Provider started:   %s\n", state.StartedAt.Format(time.RFC3339))
+	}
+	if state != nil {
+		if p, err := proxyStatePath(); err == nil {
+			fmt.Printf("  Proxy state file:   %s\n", p)
+		}
+	}
+	fmt.Printf("  Health state:       %s/proxy_health.state\n", healthDir)
+	if p, err := proxyURLStatePath(); err == nil {
+		fmt.Printf("  URL state:          %s\n", p)
+	}
+
+	totalAcquired, totalDenied := globalContractMetrics.totals()
+	a15, d15 := globalContractMetrics.windowTotals(15 * time.Minute)
+	a60, d60 := globalContractMetrics.windowTotals(60 * time.Minute)
+	a1440, d1440 := globalContractMetrics.windowTotals(1440 * time.Minute)
+
+	fmt.Println()
+	fmt.Println(" --- Contract Stats ---")
+	cTotal := totalAcquired + totalDenied
+	winRate := 0.0
+	if cTotal > 0 {
+		winRate = float64(totalAcquired) / float64(cTotal) * 100
+	}
+	fmt.Printf("  Acquired:           %d\n", totalAcquired)
+	fmt.Printf("  Denied:             %d\n", totalDenied)
+	fmt.Printf("  Win rate:           %.1f%%\n", winRate)
+	fmt.Printf("  15m:  %d acquired / %d denied\n", a15, d15)
+	fmt.Printf("  1h:   %d acquired / %d denied\n", a60, d60)
+	fmt.Printf("  24h:  %d acquired / %d denied\n", a1440, d1440)
+	fmt.Println("=========================================================================")
+}
