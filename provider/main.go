@@ -278,7 +278,7 @@ Options:
 func auth(opts docopt.Opts) {
 	home, err := os.UserHomeDir()
 	if err != nil {
-		panic(err)
+		shmLogFatal(10, "could not determine home directory: %v", err)
 	}
 	urNetworkDir := filepath.Join(home, ".urnetwork")
 	jwtPath := filepath.Join(urNetworkDir, "jwt")
