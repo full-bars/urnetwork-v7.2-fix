@@ -16,6 +16,7 @@ import (
 	"regexp"
 	"runtime"
 	"runtime/debug"
+	"runtime/metrics"
 	"strings"
 	"sync"
 	"syscall"
@@ -1165,4 +1166,23 @@ func writeProxyConfig(proxyConfig *ProxyConfig) {
 	if err != nil {
 		panic(err)
 	}
+}
+
+func metricBytesToMiB(name string, v metrics.Value) uint64 {
+	switch v.Kind() {
+	case metrics.KindUint64:
+		return v.Uint64() / 1024 / 1024
+	case metrics.KindFloat64:
+		return uint64(v.Float64()) / 1024 / 1024
+	default:
+		return 0
+	}
+}
+
+func parseProxyString(s string) (string, string) {
+	parts := strings.SplitN(s, " (", 2)
+	if len(parts) == 2 {
+		return parts[0], strings.TrimRight(parts[1], ")")
+	}
+	return s, ""
 }
