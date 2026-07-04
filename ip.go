@@ -9,7 +9,7 @@ import (
 	"math"
 	mathrand "math/rand"
 	"net"
-	// "syscall"
+	"runtime"
 	// "runtime/debug"
 	"slices"
 	"strconv"
@@ -121,7 +121,7 @@ func DefaultLocalUserNatSettings() *LocalUserNatSettings {
 func DefaultLocalUserNatSettingsWithBufferSize(bufferSize int) *LocalUserNatSettings {
 	return &LocalUserNatSettings{
 		SequenceBufferSize: bufferSize,
-		SendShardCount:     1,
+		SendShardCount:     min(max(runtime.NumCPU(), 1), 16),
 		// BufferTimeout:      15 * time.Second,
 		UdpBufferSettings: DefaultUdpBufferSettingsWithBufferSize(bufferSize),
 		TcpBufferSettings: DefaultTcpBufferSettingsWithBufferSize(bufferSize),
