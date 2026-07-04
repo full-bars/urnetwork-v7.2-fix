@@ -63,9 +63,16 @@ func validateJWTExpiry(byJwt string) error {
 var provideStartTime time.Time
 
 var proxyWarmupDone atomic.Bool
+var proxyLaunchCount atomic.Int64
 
 var webhookClient = &http.Client{Timeout: 5 * time.Second}
 var containerIDRe = regexp.MustCompile("^[0-9a-f]{12}$")
+
+// trafficBytes holds per-proxy byte counters for one tick, used to compute deltas.
+type trafficBytes struct {
+	rx uint64
+	tx uint64
+}
 
 type ecoState int
 
