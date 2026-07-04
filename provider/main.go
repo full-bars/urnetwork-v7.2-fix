@@ -1852,3 +1852,170 @@ func runProfitHeartbeat(ctx context.Context) {
 		}
 	}
 }
+
+func resolveDuration(opts docopt.Opts, flag, envVar string, def time.Duration) time.Duration {
+	if v, _ := opts.String(flag); v != "" {
+		if d, err := time.ParseDuration(v); err == nil {
+			return d
+		}
+		tlog("[proxy][url] warning: invalid duration %q for %s; using default %s\n", v, flag, def)
+		return def
+	}
+	if v := os.Getenv(envVar); v != "" {
+		if d, err := time.ParseDuration(v); err == nil {
+			return d
+		}
+		tlog("[proxy][url] warning: invalid duration %q for %s; using default %s\n", v, envVar, def)
+	}
+	return def
+}
+
+// resolveInt is resolveDuration's integer counterpart.
+
+func resolveInt(opts docopt.Opts, flag, envVar string, def int) int {
+	if v, _ := opts.String(flag); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			return n
+		}
+		tlog("[proxy][url] warning: invalid integer %q for %s; using default %d\n", v, flag, def)
+		return def
+	}
+	if v := os.Getenv(envVar); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			return n
+		}
+		tlog("[proxy][url] warning: invalid integer %q for %s; using default %d\n", v, envVar, def)
+	}
+	return def
+}
+
+// resolveString is resolveDuration's plain-string counterpart.
+
+func resolveString(opts docopt.Opts, flag, envVar, def string) string {
+	if v, _ := opts.String(flag); v != "" {
+		return v
+	}
+	if v := os.Getenv(envVar); v != "" {
+		return v
+	}
+	return def
+}
+
+// resolveProxyURLs collects --proxy_url flag values, PROXY_URL env var
+// values (comma-separated), and persisted sources from proxy_url.json
+// (added via `proxy add-source`), deduplicated, in that priority order.
+
+func resolveProxyURLs(opts docopt.Opts) []string {
+	var urls []string
+
+	if v, ok := opts["--proxy_url"]; ok && v != nil {
+		switch vv := v.(type) {
+		case []string:
+			urls = append(urls, vv...)
+		case string:
+			if vv != "" {
+				urls = append(urls, vv)
+			}
+		}
+	}
+
+	if envURLs := os.Getenv("PROXY_URL"); envURLs != "" {
+		for _, u := range strings.Split(envURLs, ",") {
+			if u = strings.TrimSpace(u); u != "" {
+				urls = append(urls, u)
+			}
+		}
+	}
+
+	if urlState, err := readProxyURLState(); err != nil {
+		tlog("[proxy][url] warning: could not read proxy_url.json: %v\n", err)
+	} else {
+		urls = append(urls, urlState.Sources...)
+	}
+
+	seen := map[string]bool{}
+	deduped := make([]string, 0, len(urls))
+	for _, u := range urls {
+		if !seen[u] {
+			seen[u] = true
+			deduped = append(deduped, u)
+		}
+	}
+	return deduped
+}
+
+func confirm(prompt string) bool {
+	fmt.Printf("%s [y/N] ", prompt)
+	scanner := bufio.NewScanner(os.Stdin)
+	if scanner.Scan() {
+		resp := scanner.Text()
+		return strings.ToLower(strings.TrimSpace(resp)) == "y"
+	}
+	return false
+}
+
+func applyLowmodeSettings(clientSettings *connect.ClientSettings, localUserNatSettings *connect.LocalUserNatSettings) {
+	if os.Getenv("URNETWORK_PROFILE") != "lowmem" {
+		return
+	}
+
+	// 1. Initial Contract Size: 2 MiB -> 256 KiB
+	clientSettings.ContractManagerSettings.InitialContractTransferByteCount = 256 * 1024
+
+	// 2. IP Buffer Depth: 256 -> 16
+	localUserNatSettings.SequenceBufferSize = 16
+	localUserNatSettings.TcpBufferSettings.SequenceBufferSize = 16
+	localUserNatSettings.UdpBufferSettings.SequenceBufferSize = 16
+
+	// 3. TCP Accordion Window: 1MB -> 32KB
+	localUserNatSettings.TcpBufferSettings.MaxWindowSize = 32 * 1024
+}
+
+// detectEffectiveRAMLimitBytes returns the effective RAM ceiling in bytes.
+// Checks cgroup v2, then cgroup v1, then /proc/meminfo MemTotal.
+func detectEffectiveRAMLimitBytes() int64 {
+	// cgroup v2
+	if data, err := os.ReadFile("/sys/fs/cgroup/memory.max"); err == nil {
+		s := strings.TrimSpace(string(data))
+		if s != "max" {
+			if v, err := strconv.ParseInt(s, 10, 64); err == nil && v > 0 {
+				return v
+			}
+		}
+	}
+	// cgroup v1 — sentinel for "no limit" is near max int64; filter anything >= 1 TiB
+	const oneTiB = 1 << 40
+	if data, err := os.ReadFile("/sys/fs/cgroup/memory/memory.limit_in_bytes"); err == nil {
+		if v, err := strconv.ParseInt(strings.TrimSpace(string(data)), 10, 64); err == nil && v > 0 && v < oneTiB {
+			return v
+		}
+	}
+	// /proc/meminfo MemTotal (kB)
+	if f, err := os.Open("/proc/meminfo"); err == nil {
+		defer f.Close()
+		scanner := bufio.NewScanner(f)
+		for scanner.Scan() {
+			line := scanner.Text()
+			if strings.HasPrefix(line, "MemTotal:") {
+				fields := strings.Fields(line)
+				if len(fields) >= 2 {
+					if v, err := strconv.ParseInt(fields[1], 10, 64); err == nil {
+						return v * 1024
+					}
+				}
+			}
+		}
+	}
+	return 850 * 1024 * 1024
+}
+
+func RunStartupAudit() (slowDisk bool, lowSpace bool) {
+	tlog("[audit] Running system checks...\n")
+	profile := os.Getenv("URNETWORK_PROFILE")
+	ramlogs := os.Getenv("URNETWORK_RAMLOGS")
+
+	// If RAM logs are already ON (manually or via profile), skip disk benchmark
+	skipDisk := (ramlogs == "1" || profile == "lowmem" || profile == "eco")
+
+	return connect.RunSystemAudit(skipDisk)
+}
