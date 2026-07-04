@@ -2019,3 +2019,15 @@ func RunStartupAudit() (slowDisk bool, lowSpace bool) {
 
 	return connect.RunSystemAudit(skipDisk)
 }
+
+func initSHMLoggerWithHandover() {
+	fmt.Printf("\n[audit] Slow disk detected. Moving all subsequent logs to RAM (/dev/shm) for performance.\n")
+	tlog("[audit] >>> To view live logs, run: urnet-tools logs <<<\n")
+	tlog("[audit] Redirecting in 3...")
+	time.Sleep(1 * time.Second)
+	fmt.Printf(" 2...")
+	time.Sleep(1 * time.Second)
+	fmt.Printf(" 1...\n")
+	time.Sleep(1 * time.Second)
+	initSHMLogger()
+}
