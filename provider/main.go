@@ -16,6 +16,7 @@ import (
 	"regexp"
 	"runtime"
 	"runtime/debug"
+	"runtime/metrics"
 	"strconv"
 	"strings"
 	"sync"
@@ -56,6 +57,8 @@ func validateJWTExpiry(byJwt string) error {
 }
 
 var provideStartTime time.Time
+
+var proxyWarmupDone atomic.Bool
 
 type ecoState int
 
@@ -645,6 +648,23 @@ func provide(opts docopt.Opts) {
 
 	// exit
 	os.Exit(0)
+}
+
+func backoffPacer(n int, staggerMs int, now time.Time, proxyCtx context.Context) bool {
+	if staggerMs <= 0 {
+		return true
+	}
+	jitter := mathrand.Intn(staggerMs + 1)
+	if mathrand.Intn(2) == 0 {
+		jitter = -jitter
+	}
+	wait := time.Duration(n)*time.Duration(staggerMs)*time.Millisecond + time.Duration(jitter)*time.Millisecond
+	select {
+	case <-proxyCtx.Done():
+		return false
+	case <-time.After(wait):
+	}
+	return true
 }
 
 func applyTurboSettings(clientSettings *connect.ClientSettings, localUserNatSettings *connect.LocalUserNatSettings) {
@@ -1480,4 +1500,68 @@ func formatDuration(d time.Duration) string {
 		return fmt.Sprintf("%dm", m)
 	}
 	return fmt.Sprintf("%dh %dm", h, m)
+}
+
+func metricBytesToMiB(name string, v metrics.Value) uint64 {
+	switch v.Kind() {
+	case metrics.KindUint64:
+		return v.Uint64() / 1024 / 1024
+	case metrics.KindFloat64:
+		return uint64(v.Float64()) / 1024 / 1024
+	default:
+		return 0
+	}
+}
+
+func readProxySettingsFromFile(path string) ([]*connect.ProxySettings, error) {
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("could not read proxy file %s: %w", path, err)
+	}
+	var all []*connect.ProxySettings
+	for _, line := range strings.Split(string(b), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" || line[0] == '#' {
+			continue
+		}
+		address, user, password := parseProxyAddress(line)
+		if user == "" || password == "" {
+			tlog("[proxy] error: proxy %q missing credentials\n", line)
+			continue
+		}
+		all = append(all, &connect.ProxySettings{
+			Network: "tcp",
+			Address: address,
+			Auth:    &proxy.Auth{User: user, Password: password},
+		})
+	}
+	return all, nil
+}
+
+func removeAddressesFromFile(path string, addresses []string) error {
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return err
+	}
+	removeSet := map[string]bool{}
+	for _, a := range addresses {
+		removeSet[a] = true
+	}
+	var kept []string
+	for _, line := range strings.Split(string(b), "\n") {
+		trimmed := strings.TrimSpace(line)
+		addr, _, _ := parseProxyAddress(trimmed)
+		if !removeSet[addr] {
+			kept = append(kept, line)
+		}
+	}
+	content := strings.Join(kept, "\n")
+	if len(b) > 0 && b[len(b)-1] == '\n' && (len(content) == 0 || content[len(content)-1] != '\n') {
+		content += "\n"
+	}
+	tmp := path + ".tmp"
+	if err := os.WriteFile(tmp, []byte(content), 0600); err != nil {
+		return err
+	}
+	return os.Rename(tmp, path)
 }
