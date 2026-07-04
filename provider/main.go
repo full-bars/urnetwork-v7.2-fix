@@ -39,6 +39,8 @@ import (
 const DefaultApiUrl = "https://api.bringyour.com"
 const DefaultConnectUrl = "wss://connect.bringyour.com"
 
+const profitIdleLogInterval = 5 * time.Minute
+
 // this value is set via the linker, e.g.
 // -ldflags "-X main.Version=$WARP_VERSION-$WARP_VERSION_CODE"
 var Version string
@@ -355,9 +357,11 @@ func runOutageWatcher(ctx context.Context, nodeName string, envWebhookURL string
 	var lastStartFire, lastClearFire time.Time
 	webhookURL := resolveAlertWebhook(envWebhookURL)
 	if webhookURL != "" {
-		tlog("[outage] watcher active node=%s webhook=configured\n", nodeName)
+		tlog("[outage] watcher active node=%s webhook=configured
+", nodeName)
 	} else {
-		tlog("[outage] watcher active node=%s\n", nodeName)
+		tlog("[outage] watcher active node=%s
+", nodeName)
 	}
 	ticker := time.NewTicker(pollInterval)
 	defer ticker.Stop()
@@ -370,9 +374,11 @@ func runOutageWatcher(ctx context.Context, nodeName string, envWebhookURL string
 		if resolved := resolveAlertWebhook(envWebhookURL); resolved != webhookURL {
 			webhookURL = resolved
 			if webhookURL != "" {
-				tlog("[outage] webhook updated node=%s webhook=configured\n", nodeName)
+				tlog("[outage] webhook updated node=%s webhook=configured
+", nodeName)
 			} else {
-				tlog("[outage] webhook disabled node=%s\n", nodeName)
+				tlog("[outage] webhook disabled node=%s
+", nodeName)
 			}
 		}
 		if connect.IsBackendDegraded() {
@@ -381,7 +387,8 @@ func runOutageWatcher(ctx context.Context, nodeName string, envWebhookURL string
 				degradedCount++
 				if degradedCount >= startConfirm {
 					degraded = true
-					tlog("[outage] backend degraded — holding existing connections, not accepting new ones\n")
+					tlog("[outage] backend degraded — holding existing connections, not accepting new ones
+")
 					if webhookURL != "" && time.Since(lastStartFire) >= cooldown {
 						lastStartFire = time.Now()
 						go fireWebhook(webhookURL, nodeName, "outage_start",
@@ -396,71 +403,14 @@ func runOutageWatcher(ctx context.Context, nodeName string, envWebhookURL string
 				if clearCount >= clearConfirm {
 					degraded = false
 					clearCount = 0
-					tlog("[outage] backend recovered\n")
+					tlog("[outage] backend recovered
+")
 					if webhookURL != "" && time.Since(lastClearFire) >= cooldown {
 						lastClearFire = time.Now()
 						go fireWebhook(webhookURL, nodeName, "outage_clear", "Backend connectivity restored.")
 					}
 				}
 			}
-		}
-	}
-}
-
-func fireWebhook(url, nodeName, event, message string) {
-	var payload []byte
-	var err error
-	switch {
-	case strings.Contains(url, "discord.com"), strings.Contains(url, "discordapp.com"):
-		line := fmt.Sprintf("URnetwork [%s] node=%s: %s", event, nodeName, message)
-		payload, err = json.Marshal(map[string]string{"content": line})
-	case strings.Contains(url, "hooks.slack.com"):
-		line := fmt.Sprintf("URnetwork [%s] node=%s: %s", event, nodeName, message)
-		payload, err = json.Marshal(map[string]string{"text": line})
-	default:
-		payload, err = json.Marshal(map[string]string{
-			"event":     event,
-			"node":      nodeName,
-			"timestamp": time.Now().UTC().Format(time.RFC3339),
-			"message":   message,
-		})
-	}
-	if err != nil {
-		tlog("[webhook] marshal failed: %v\n", err)
-		return
-	}
-	resp, err := webhookClient.Post(url, "application/json", bytes.NewReader(payload))
-	if err != nil {
-		tlog("[webhook] POST failed: %v\n", err)
-		return
-	}
-	resp.Body.Close()
-}
-
-func paceMonitor(ctx context.Context) {
-	ticker := time.NewTicker(30 * time.Second)
-	defer ticker.Stop()
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-ticker.C:
-		}
-		up, _, _, _, connecting := connect.ProxyHealthSnapshot()
-		total := connect.ProxyHealthCount()
-		if total < 5 {
-			continue
-		}
-		pct := float64(up) * 100 / float64(total)
-		connectingN := len(connecting)
-		if up*100/total > 90 && connectingN < 5 {
-			proxyWarmupDone.Store(true)
-			return
-		}
-		if connectingN > 10 && pct < 50 {
-			tlog("⚠ [pace] warmup: %d/%d up (%.0f%%), %d connecting\n", up, total, pct, connectingN)
-		} else {
-			tlog("[pace] warmup: %d/%d up (%.0f%%), %d connecting\n", up, total, pct, connectingN)
 		}
 	}
 }
@@ -1778,4 +1728,228 @@ func removeAddressesFromFile(path string, addresses []string) error {
 		return err
 	}
 	return os.Rename(tmp, path)
+}
+
+func fmtRate(bytesPerSec float64) string {
+	switch {
+	case bytesPerSec >= 1e9:
+		return fmt.Sprintf("%.1f GB/s", bytesPerSec/1e9)
+	case bytesPerSec >= 1e6:
+		return fmt.Sprintf("%.1f MB/s", bytesPerSec/1e6)
+	case bytesPerSec >= 1e3:
+		return fmt.Sprintf("%.1f KB/s", bytesPerSec/1e3)
+	default:
+		return fmt.Sprintf("%.0f B/s", bytesPerSec)
+	}
+}
+
+func fmtBytes(b uint64) string {
+	switch {
+	case b >= 1<<30:
+		return fmt.Sprintf("%.2f GB", float64(b)/float64(1<<30))
+	case b >= 1<<20:
+		return fmt.Sprintf("%.1f MB", float64(b)/float64(1<<20))
+	case b >= 1<<10:
+		return fmt.Sprintf("%.0f KB", float64(b)/float64(1<<10))
+	default:
+		return fmt.Sprintf("%d B", b)
+	}
+}
+
+func nextMidnight(t time.Time) time.Time {
+	y, m, d := t.Date()
+	return time.Date(y, m, d+1, 0, 0, 0, 0, t.Location())
+}
+
+func sumLastN(deltas []uint64, n int) uint64 {
+	if len(deltas) < n {
+		n = len(deltas)
+	}
+	var total uint64
+	for _, d := range deltas[len(deltas)-n:] {
+		total += d
+	}
+	return total
+}
+
+func runEarningWindows(ctx context.Context) {
+	const maxSamples = 60
+	deltas := make([]uint64, 0, maxSamples)
+	var prevCum uint64
+	var prevSet bool
+	ticker := time.NewTicker(1 * time.Minute)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+		}
+		if connect.ProxyHealthCount() == 0 {
+			prevSet = false
+			continue
+		}
+		_, _, _, bw, _ := connect.ProxyHealthSnapshot()
+		var cum uint64
+		for _, p := range bw {
+			cum += p.BillableRx.Load() + p.BillableTx.Load()
+		}
+		if prevSet {
+			if cum >= prevCum {
+				deltas = append(deltas, cum-prevCum)
+			} else {
+				deltas = append(deltas, 0)
+			}
+			if len(deltas) > maxSamples {
+				deltas = deltas[len(deltas)-maxSamples:]
+			}
+			billable1m := sumLastN(deltas, 1)
+			billable5m := sumLastN(deltas, 5)
+			billable15m := sumLastN(deltas, 15)
+			billable60m := sumLastN(deltas, 60)
+			active := "no"
+			if billable1m > 0 {
+				active = "yes"
+			}
+			tlog("💰 [earn] billable_1m=%s billable_5m=%s billable_15m=%s billable_60m=%s active=%s\n",
+				fmtBytes(billable1m), fmtBytes(billable5m), fmtBytes(billable15m), fmtBytes(billable60m), active)
+		}
+		prevCum = cum
+		prevSet = true
+	}
+}
+
+func runProfitHeartbeat(ctx context.Context) {
+	const interval = 15 * time.Second
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	var prevBillable uint64
+	var prevSet bool
+	prevTickTime := time.Now()
+	var lastLogTime time.Time
+	wasEarning := false
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+		}
+		if connect.ProxyHealthCount() == 0 {
+			prevSet = false
+			continue
+		}
+		proxiesUp, _, _, bw, connecting := connect.ProxyHealthSnapshot()
+		var billable uint64
+		var clients int64
+		var serving int
+		for _, p := range bw {
+			billable += p.BillableRx.Load() + p.BillableTx.Load()
+			pc := p.Clients.Load()
+			clients += pc
+			if pc > 0 {
+				serving++
+			}
+		}
+		now := time.Now()
+		if !prevSet {
+			prevBillable = billable
+			prevTickTime = now
+			prevSet = true
+			continue
+		}
+		elapsed := now.Sub(prevTickTime).Seconds()
+		if elapsed < 1 {
+			elapsed = 1
+		}
+		var delta uint64
+		if billable >= prevBillable {
+			delta = billable - prevBillable
+		}
+		prevBillable = billable
+		prevTickTime = now
+		earning := delta > 0 && clients > 0
+		justStopped := wasEarning && !earning
+		wasEarning = earning
+		if earning || justStopped || lastLogTime.IsZero() || now.Sub(lastLogTime) >= profitIdleLogInterval {
+			status := "no"
+			if earning {
+				status = "yes"
+			}
+			idle := proxiesUp - serving
+			if idle < 0 {
+				idle = 0
+			}
+			warmup := len(connecting) >= 5
+			reason := earningReason(earning, proxiesUp, clients, warmup)
+			profitEmoji := ""
+			if status == "yes" {
+				profitEmoji = "💰 "
+			}
+			tlog("%s[profit] earning=%s reason=%s clients=%d rate=%s proxies_up=%d serving=%d idle=%d\n",
+				profitEmoji, status, reason, clients, fmtRate(float64(delta)/elapsed), proxiesUp, serving, idle)
+			lastLogTime = now
+		}
+	}
+}
+
+func fireWebhook(url, nodeName, event, message string) {
+	var payload []byte
+	var err error
+	switch {
+	case strings.Contains(url, "discord.com"), strings.Contains(url, "discordapp.com"):
+		line := fmt.Sprintf("URnetwork [%s] node=%s: %s", event, nodeName, message)
+		payload, err = json.Marshal(map[string]string{"content": line})
+	case strings.Contains(url, "hooks.slack.com"):
+		line := fmt.Sprintf("URnetwork [%s] node=%s: %s", event, nodeName, message)
+		payload, err = json.Marshal(map[string]string{"text": line})
+	default:
+		payload, err = json.Marshal(map[string]string{
+			"event":     event,
+			"node":      nodeName,
+			"timestamp": time.Now().UTC().Format(time.RFC3339),
+			"message":   message,
+		})
+	}
+	if err != nil {
+		tlog("[webhook] marshal failed: %v
+", err)
+		return
+	}
+	resp, err := webhookClient.Post(url, "application/json", bytes.NewReader(payload))
+	if err != nil {
+		tlog("[webhook] POST failed: %v
+", err)
+		return
+	}
+	resp.Body.Close()
+}
+
+func paceMonitor(ctx context.Context) {
+	ticker := time.NewTicker(30 * time.Second)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+		}
+		up, _, _, _, connecting := connect.ProxyHealthSnapshot()
+		total := connect.ProxyHealthCount()
+		if total < 5 {
+			continue
+		}
+		pct := float64(up) * 100 / float64(total)
+		connectingN := len(connecting)
+		if up*100/total > 90 && connectingN < 5 {
+			proxyWarmupDone.Store(true)
+			return
+		}
+		if connectingN > 10 && pct < 50 {
+			tlog("⚠ [pace] warmup: %d/%d up (%.0f%%), %d connecting
+", up, total, pct, connectingN)
+		} else {
+			tlog("[pace] warmup: %d/%d up (%.0f%%), %d connecting
+", up, total, pct, connectingN)
+		}
+	}
 }
