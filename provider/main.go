@@ -298,8 +298,11 @@ func provide(opts docopt.Opts) {
 		}
 	}
 	if 0 < maxMemory {
+		connect.ResizeMessagePools(maxMemory / 8)
 		debug.SetMemoryLimit(maxMemory)
 	}
+
+	applyPoolAutoSize(maxMemory)
 
 	event := connect.NewEventWithContext(context.Background())
 	event.SetOnSignals(syscall.SIGINT, syscall.SIGQUIT, syscall.SIGTERM)
@@ -514,6 +517,27 @@ func provide(opts docopt.Opts) {
 
 	// exit
 	os.Exit(0)
+}
+
+func applyPoolAutoSize(maxMemory connect.ByteCount) {
+	if maxMemory > 0 {
+		return
+	}
+	if os.Getenv("URNETWORK_PROFILE") == "lowmem" {
+		return
+	}
+	ram := connect.DetectEffectiveRAMLimitBytes()
+	poolBytes := connect.ByteCount(ram) / 32
+	const floor = 8 * 1024 * 1024
+	const ceiling = 256 * 1024 * 1024
+	if poolBytes < floor {
+		poolBytes = floor
+	}
+	if poolBytes > ceiling {
+		poolBytes = ceiling
+	}
+	connect.ResizeMessagePools(poolBytes)
+	fmt.Printf("[pool] message pool %dMiB (RAM=%dMiB)\n", poolBytes/1024/1024, connect.ByteCount(ram)/1024/1024)
 }
 
 // providerStatePath returns the absolute filesystem path of a named

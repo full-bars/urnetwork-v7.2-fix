@@ -1,16 +1,18 @@
 package connect
 
 import (
+	"bufio"
 	"context"
 	"os"
 	"os/signal"
 	"slices"
+	"strconv"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
 	// "fmt"
 	// "runtime/debug"
-	// "strings"
 	// "encoding/json"
 	// "reflect"
 	mathrand "math/rand"
@@ -392,4 +394,37 @@ func (self *Reconnect) After() <-chan time.Time {
 		randomTimeout := time.Duration(mathrand.Int63n(int64(timeout)))
 		return time.After(randomTimeout)
 	}
+}
+
+func DetectEffectiveRAMLimitBytes() int64 {
+	if data, err := os.ReadFile("/sys/fs/cgroup/memory.max"); err == nil {
+		s := strings.TrimSpace(string(data))
+		if s != "max" {
+			if v, err := strconv.ParseInt(s, 10, 64); err == nil && v > 0 {
+				return v
+			}
+		}
+	}
+	const oneTiB = 1 << 40
+	if data, err := os.ReadFile("/sys/fs/cgroup/memory/memory.limit_in_bytes"); err == nil {
+		if v, err := strconv.ParseInt(strings.TrimSpace(string(data)), 10, 64); err == nil && v > 0 && v < oneTiB {
+			return v
+		}
+	}
+	if f, err := os.Open("/proc/meminfo"); err == nil {
+		defer f.Close()
+		scanner := bufio.NewScanner(f)
+		for scanner.Scan() {
+			line := scanner.Text()
+			if strings.HasPrefix(line, "MemTotal:") {
+				fields := strings.Fields(line)
+				if len(fields) >= 2 {
+					if v, err := strconv.ParseInt(fields[1], 10, 64); err == nil {
+						return v * 1024
+					}
+				}
+			}
+		}
+	}
+	return 512 * 1024 * 1024
 }
