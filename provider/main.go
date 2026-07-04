@@ -2019,3 +2019,4 @@ func RunStartupAudit() (slowDisk bool, lowSpace bool) {
 
 	return connect.RunSystemAudit(skipDisk)
 }
+
