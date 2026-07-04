@@ -102,6 +102,12 @@ func initGlog() {
 	flag.Set("v", "0")
 	// unlike unix, the android/ios standard is for diagnostics to go to stdout
 	os.Stderr = os.Stdout
+
+	profile := os.Getenv("URNETWORK_PROFILE")
+	ramlogs := os.Getenv("URNETWORK_RAMLOGS") == "1"
+	if profile == "lowmem" || profile == "eco" || ramlogs {
+		initSHMLogger()
+	}
 }
 
 func main() {
@@ -272,7 +278,7 @@ Options:
 func auth(opts docopt.Opts) {
 	home, err := os.UserHomeDir()
 	if err != nil {
-		panic(err)
+		shmLogFatal(10, "could not determine home directory: %v", err)
 	}
 	urNetworkDir := filepath.Join(home, ".urnetwork")
 	jwtPath := filepath.Join(urNetworkDir, "jwt")
@@ -353,13 +359,13 @@ func auth(opts docopt.Opts) {
 		}
 
 		if loginResult.Error != nil {
-			panic(loginResult.Error)
+			shmLogFatal(11, "authentication request failed: %v", loginResult.Error)
 		}
 		if loginResult.Result.Error != nil {
-			panic(fmt.Errorf("%s", loginResult.Result.Error.Message))
+			shmLogFatal(12, "authentication failed: %s", loginResult.Result.Error.Message)
 		}
 		if loginResult.Result.VerificationRequired != nil {
-			panic(fmt.Errorf("Verification required for %s. Use the app or web to complete account setup.", loginResult.Result.VerificationRequired.UserAuth))
+			shmLogFatal(13, "verification required for %s — complete account setup via the app or web first", loginResult.Result.VerificationRequired.UserAuth)
 		}
 
 		byJwt = loginResult.Result.Network.ByJwt
@@ -392,10 +398,10 @@ func auth(opts docopt.Opts) {
 		}
 
 		if authCodeLoginResult.Error != nil {
-			panic(authCodeLoginResult.Error)
+			shmLogFatal(14, "authentication code request failed: %v", authCodeLoginResult.Error)
 		}
 		if authCodeLoginResult.Result.Error != nil {
-			panic(fmt.Errorf("%s", authCodeLoginResult.Result.Error.Message))
+			shmLogFatal(15, "authentication code rejected: %s — auth codes are single-use; if restarting, mount /root/.urnetwork as a persistent volume", authCodeLoginResult.Result.Error.Message)
 		}
 
 		byJwt = authCodeLoginResult.Result.ByJwt
@@ -403,9 +409,11 @@ func auth(opts docopt.Opts) {
 
 	if byJwt != "" {
 		if err := os.MkdirAll(urNetworkDir, 0700); err != nil {
-			panic(err)
+			shmLogFatal(16, "could not create %s: %v", urNetworkDir, err)
 		}
-		os.WriteFile(jwtPath, []byte(byJwt), 0700)
+		if err := os.WriteFile(jwtPath, []byte(byJwt), 0700); err != nil {
+			shmLogFatal(17, "could not write jwt to %s: %v", jwtPath, err)
+		}
 		fmt.Printf("Jwt written to %s\n", jwtPath)
 	}
 }
@@ -1675,7 +1683,7 @@ func applyPoolAutoSize(maxMemory connect.ByteCount) {
 func providerStatePath(name string) (string, error) {
 	home, err := os.UserHomeDir()
 	if err != nil {
-		return "", err
+		shmLogFatal(10, "could not determine home directory: %v", err)
 	}
 	return filepath.Join(home, ".urnetwork", name), nil
 }
@@ -2089,10 +2097,30 @@ func proxyAdd(opts docopt.Opts) {
 }
 
 func proxyRemove(opts docopt.Opts) {
+	if pattern, _ := opts.String("--match"); pattern != "" {
+		proxyRemoveMatch(pattern, opts)
+		return
+	}
+
 	proxyConfig := readProxyConfig()
 
 	if all, _ := opts.Bool("--all"); all {
 		clear(proxyConfig.Servers)
+
+		if state, err := readProxyState(); err == nil {
+			state.Proxies = map[string]ProxyEntry{}
+			state.NextID = 0
+			if err := writeProxyState(state); err != nil {
+				tlog("[proxy] warning: could not reset proxy.state: %v\n", err)
+			}
+		}
+		if urlState, err := readProxyURLState(); err == nil {
+			urlState.Cache = map[string]ProxyURLEntry{}
+			urlState.Sources = nil
+			if err := writeProxyURLState(urlState); err != nil {
+				tlog("[proxy] warning: could not clear proxy_url.json cache: %v\n", err)
+			}
+		}
 	} else {
 
 		allKeyAddress := []string{}
@@ -2209,7 +2237,8 @@ func obfuscatePassword(password string) string {
 func readProxyConfig() *ProxyConfig {
 	home, err := os.UserHomeDir()
 	if err != nil {
-		panic(err)
+		tlog("[proxy] Error: could not find user home directory: %v\n", err)
+		return &ProxyConfig{}
 	}
 	urNetworkDir := filepath.Join(home, ".urnetwork")
 	proxyPath := filepath.Join(urNetworkDir, "proxy")
@@ -2220,13 +2249,15 @@ func readProxyConfig() *ProxyConfig {
 
 	b, err := os.ReadFile(proxyPath)
 	if err != nil {
-		panic(err)
+		tlog("[proxy] Error: could not read proxy config at %s: %v\n", proxyPath, err)
+		return &ProxyConfig{}
 	}
 
 	var proxyConfig ProxyConfig
 	err = json.Unmarshal(b, &proxyConfig)
 	if err != nil {
-		panic(err)
+		tlog("[proxy] Error: could not parse proxy config at %s: %v\n", proxyPath, err)
+		return &ProxyConfig{}
 	}
 	return &proxyConfig
 }
