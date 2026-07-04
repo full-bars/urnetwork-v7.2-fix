@@ -34,6 +34,25 @@ func shouldLogAuthErr() (bool, int64)   { return authErrThrottle.Allow(time.Now(
 func shouldLogSelectErr() (bool, int64) { return selectErrThrottle.Allow(time.Now()) }
 func shouldLogWriteErr() (bool, int64)  { return writeErrThrottle.Allow(time.Now()) }
 
+var lastBackendFailNano atomic.Int64
+var consecutiveBackendFails atomic.Int64
+var activeProxyConnections int64
+
+func ActiveProxyConnections() int64 {
+	return atomic.LoadInt64(&activeProxyConnections)
+}
+
+const backendDegradedFailThreshold = 3
+const backendDegradedWindow = 2 * time.Minute
+
+func IsBackendDegraded() bool {
+	if consecutiveBackendFails.Load() < backendDegradedFailThreshold {
+		return false
+	}
+	now := time.Now().UnixNano()
+	return now-lastBackendFailNano.Load() < int64(backendDegradedWindow)
+}
+
 // note that it is possible to have multiple transports for the same client destination
 // e.g. platform, p2p, and a bunch of extenders
 

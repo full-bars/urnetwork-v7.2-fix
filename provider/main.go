@@ -53,6 +53,8 @@ func validateJWTExpiry(byJwt string) error {
 	return nil
 }
 
+var provideStartTime time.Time
+
 func init() {
 	// debug.SetGCPercent(10)
 
@@ -290,7 +292,73 @@ func auth(opts docopt.Opts) {
 	}
 }
 
+func runHealthHeartbeat(ctx context.Context, startTime time.Time, profile string) {
+	interval := 5 * time.Minute
+	if s := os.Getenv("URNETWORK_HEALTH_INTERVAL"); s != "" {
+		if d, err := time.ParseDuration(s); err == nil && d >= time.Minute {
+			interval = d
+		}
+	}
+	if profile == "" {
+		profile = "default"
+	}
+
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+		}
+
+		var m runtime.MemStats
+		runtime.ReadMemStats(&m)
+		uptime := time.Since(startTime).Round(time.Second)
+		proxies := connect.ActiveProxyConnections()
+		fmt.Printf("[health] uptime=%s profile=%s heap=%dMiB sys=%dMiB connections=%d\n",
+			uptime, profile, m.HeapAlloc/1024/1024, m.Sys/1024/1024, proxies)
+	}
+}
+
+func runOutageWatcher(ctx context.Context, nodeName string, envWebhookURL string) {
+	const pollInterval = 30 * time.Second
+	const startConfirm = 10
+
+	degraded := false
+	degradedCount := 0
+
+	ticker := time.NewTicker(pollInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+		}
+
+		if connect.IsBackendDegraded() {
+			if !degraded {
+				degradedCount++
+				if degradedCount >= startConfirm {
+					degraded = true
+					fmt.Printf("[outage] backend degraded — holding existing connections\n")
+				}
+			}
+		} else {
+			degradedCount = 0
+			if degraded {
+				degraded = false
+				fmt.Printf("[outage] backend recovered\n")
+			}
+		}
+	}
+}
+
 func provide(opts docopt.Opts) {
+	provideStartTime = time.Now()
 	port, _ := opts.Int("--port")
 
 	apiUrl, err := opts.String("--api_url")
@@ -323,6 +391,9 @@ func provide(opts docopt.Opts) {
 
 	ctx, cancel := context.WithCancel(event.Ctx())
 	defer cancel()
+
+	go runOutageWatcher(ctx, os.Getenv("URNETWORK_NODE_NAME"), os.Getenv("URNETWORK_ALERT_WEBHOOK"))
+	go runHealthHeartbeat(ctx, provideStartTime, os.Getenv("URNETWORK_PROFILE"))
 
 	provideWithProxy := func(proxySettings *connect.ProxySettings) {
 		proxyCtx, proxyCancel := context.WithCancel(ctx)
