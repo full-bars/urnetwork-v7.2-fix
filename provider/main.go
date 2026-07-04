@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"encoding/json"
 	"encoding/pem"
@@ -62,6 +63,9 @@ func validateJWTExpiry(byJwt string) error {
 var provideStartTime time.Time
 
 var proxyWarmupDone atomic.Bool
+
+var webhookClient = &http.Client{Timeout: 5 * time.Second}
+var containerIDRe = regexp.MustCompile("^[0-9a-f]{12}$")
 
 type ecoState int
 
@@ -343,12 +347,23 @@ func runHealthHeartbeat(ctx context.Context, startTime time.Time, profile string
 	}
 }
 
-func runOutageWatcher(ctx context.Context, nodeName string, envWebhookURL string) {
+func runOutageWatcher(ctx context.Context, nodeName, envWebhookURL string) {
 	const pollInterval = 30 * time.Second
-	const startConfirm = 10
+	const cooldown = 5 * time.Minute
+	const clearConfirm = 2
+	const startConfirm = 10 // 10 * 30s = 5 minutes of continuous degradation
 
 	degraded := false
 	degradedCount := 0
+	clearCount := 0
+	var lastStartFire, lastClearFire time.Time
+
+	webhookURL := resolveAlertWebhook(envWebhookURL)
+	if webhookURL != "" {
+		tlog("[outage] watcher active node=%s webhook=configured\n", nodeName)
+	} else {
+		tlog("[outage] watcher active node=%s\n", nodeName)
+	}
 
 	ticker := time.NewTicker(pollInterval)
 	defer ticker.Stop()
@@ -360,19 +375,45 @@ func runOutageWatcher(ctx context.Context, nodeName string, envWebhookURL string
 		case <-ticker.C:
 		}
 
+		// Re-resolve every tick so writing ~/.urnetwork/alert_webhook can
+		// turn outage alerting on, off, or repoint it without a restart —
+		// same reasoning as the hub report URL in bandwidth_reporter.go.
+		if resolved := resolveAlertWebhook(envWebhookURL); resolved != webhookURL {
+			webhookURL = resolved
+			if webhookURL != "" {
+				tlog("[outage] webhook updated node=%s webhook=configured\n", nodeName)
+			} else {
+				tlog("[outage] webhook disabled node=%s\n", nodeName)
+			}
+		}
+
 		if connect.IsBackendDegraded() {
+			clearCount = 0
 			if !degraded {
 				degradedCount++
 				if degradedCount >= startConfirm {
 					degraded = true
-					fmt.Printf("[outage] backend degraded — holding existing connections\n")
+					tlog("[outage] backend degraded — holding existing connections, not accepting new ones\n")
+					if webhookURL != "" && time.Since(lastStartFire) >= cooldown {
+						lastStartFire = time.Now()
+						go fireWebhook(webhookURL, nodeName, "outage_start",
+							"Backend unreachable — provider holding existing connections but not accepting new ones.")
+					}
 				}
 			}
 		} else {
 			degradedCount = 0
 			if degraded {
-				degraded = false
-				fmt.Printf("[outage] backend recovered\n")
+				clearCount++
+				if clearCount >= clearConfirm {
+					degraded = false
+					clearCount = 0
+					tlog("[outage] backend recovered\n")
+					if webhookURL != "" && time.Since(lastClearFire) >= cooldown {
+						lastClearFire = time.Now()
+						go fireWebhook(webhookURL, nodeName, "outage_clear", "Backend connectivity restored.")
+					}
+				}
 			}
 		}
 	}
@@ -418,6 +459,7 @@ func provide(opts docopt.Opts) {
 	go runJWTRefresher(ctx, apiUrl)
 	go runEarningWindows(ctx)
 	go runProfitHeartbeat(ctx)
+	go paceMonitor(ctx)
 
 	provideWithProxy := func(proxySettings *connect.ProxySettings) {
 		proxyCtx, proxyCancel := context.WithCancel(ctx)
@@ -2021,6 +2063,92 @@ func RunStartupAudit() (slowDisk bool, lowSpace bool) {
 	return connect.RunSystemAudit(skipDisk)
 }
 
+func fireWebhook(url, nodeName, event, message string) {
+	// Format the body per service. Discord requires "content" and Slack requires
+	// "text"; a generic {event,node,...} body is rejected by both (HTTP 400). Any
+	// other endpoint (ntfy, custom) gets the structured JSON it can parse.
+	var payload []byte
+	var err error
+	switch {
+	case strings.Contains(url, "discord.com"), strings.Contains(url, "discordapp.com"):
+		line := fmt.Sprintf("URnetwork [%s] node=%s: %s", event, nodeName, message)
+		payload, err = json.Marshal(map[string]string{"content": line})
+	case strings.Contains(url, "hooks.slack.com"):
+		line := fmt.Sprintf("URnetwork [%s] node=%s: %s", event, nodeName, message)
+		payload, err = json.Marshal(map[string]string{"text": line})
+	default:
+		payload, err = json.Marshal(map[string]string{
+			"event":     event,
+			"node":      nodeName,
+			"timestamp": time.Now().UTC().Format(time.RFC3339),
+			"message":   message,
+		})
+	}
+	if err != nil {
+		tlog("[webhook] marshal failed: %v\n", err)
+		return
+	}
+	resp, err := webhookClient.Post(url, "application/json", bytes.NewReader(payload))
+	if err != nil {
+		tlog("[webhook] delivery failed (%s): %v\n", event, err)
+		return
+	}
+	defer resp.Body.Close()
+	io.Copy(io.Discard, resp.Body)
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		tlog("[webhook] non-2xx response (%s): %d\n", event, resp.StatusCode)
+	}
+}
+
+
+func paceMonitor(ctx context.Context) {
+	ticker := time.NewTicker(30 * time.Second)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+		}
+		up, _, _, _, connecting := connect.ProxyHealthSnapshot()
+		total := connect.ProxyHealthCount()
+		if total < 5 {
+			continue
+		}
+		pct := float64(up) * 100 / float64(total)
+		connectingN := len(connecting)
+		elapsed := time.Since(provideStartTime)
+		if elapsed > 60*time.Minute {
+			tlog("🔥 [pace] warmup: %d/%d up (%.0f%%), %d connecting — forced done after 60m\n",
+				up, total, pct, connectingN)
+			proxyWarmupDone.Store(true)
+			if reloadPath, err := proxyReloadPath(); err == nil {
+				if err := writeReloadTrigger(reloadPath); err != nil {
+					tlog("[proxy] warn: reload trigger write failed: %v\n", err)
+				}
+			}
+			return
+		}
+		if pct < 50 && connectingN > 10 {
+			tlog("🔥 [pace] ⚠ warmup: %d/%d up (%.0f%%), %d connecting, %d done\n",
+				up, total, pct, connectingN, total-up-connectingN)
+		} else if pct > 90 && connectingN < 5 {
+			tlog("🔥 [pace] ✓ warmup: %d/%d up (%.0f%%), %d connecting — done\n",
+				up, total, pct, connectingN)
+			proxyWarmupDone.Store(true)
+			if reloadPath, err := proxyReloadPath(); err == nil {
+				if err := writeReloadTrigger(reloadPath); err != nil {
+					tlog("[proxy] warn: reload trigger write failed: %v\n", err)
+				}
+			}
+			return // warmup complete — stop repeating
+		} else {
+			tlog("🔥 [pace] warmup: %d/%d up (%.0f%%), %d connecting\n",
+				up, total, pct, connectingN)
+		}
+	}
+}
+
 func activitySnapshot(shmLog string) {
 	// Single snapshot for non-interactive use
 	healthDir, ok := proxyHealthDir()
@@ -2851,3 +2979,4 @@ func proxySummary() {
 	fmt.Printf("  24h:  %d acquired / %d denied\n", a1440, d1440)
 	fmt.Println("=========================================================================")
 }
+
