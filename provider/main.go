@@ -2980,4 +2980,91 @@ func proxySummary() {
 	fmt.Println("=========================================================================")
 }
 
+func initSHMLoggerWithHandover() {
+	fmt.Printf("\n[audit] Slow disk detected. Moving all subsequent logs to RAM (/dev/shm) for performance.\n")
+	tlog("[audit] >>> To view live logs, run: urnet-tools logs <<<\n")
+	tlog("[audit] Redirecting in 3...")
+	time.Sleep(1 * time.Second)
+	fmt.Printf(" 2...")
+	time.Sleep(1 * time.Second)
+	fmt.Printf(" 1...\n")
+	time.Sleep(1 * time.Second)
+	initSHMLogger()
+}
 
+func proxyRemoveMatch(pattern string, opts docopt.Opts) {
+	autoYes, _ := opts.Bool("--yes")
+	preview, _ := opts.Bool("--preview")
+
+	proxyConfig := readProxyConfig()
+
+	// state and urlState are optional: the provider may never have run,
+	// or there may be no URL sources. Missing stores just mean fewer
+	// places to search.
+	var stateProxies map[string]ProxyEntry
+	var stateSource string
+	state, stateErr := readProxyState()
+	if stateErr == nil {
+		stateProxies = state.Proxies
+		stateSource = state.Source
+	} else {
+		state = &ProxyState{}
+	}
+	urlState, urlErr := readProxyURLState()
+	if urlErr != nil {
+		urlState = &ProxyURLState{}
+	}
+
+	addrsBySource, display := collectMatchingProxies(
+		pattern, proxyConfig.Servers, stateProxies, stateSource, urlState.Cache)
+
+	if len(display) == 0 {
+		fmt.Printf("no proxies matched %q — nothing to do\n", pattern)
+		return
+	}
+
+	const sampleMax = 10
+	fmt.Printf("%d proxies match %q:\n", len(display), pattern)
+	for i, d := range display {
+		if i == sampleMax {
+			fmt.Printf("    ... and %d more\n", len(display)-sampleMax)
+			break
+		}
+		fmt.Printf("    %s\n", d)
+	}
+
+	if preview {
+		fmt.Println("=== PREVIEW (no changes will be made) ===")
+		return
+	}
+
+	if !autoYes && !confirm(fmt.Sprintf("Remove %d proxies and exclude %q from future URL fetches?", len(display), pattern)) {
+		fmt.Println("Aborted.")
+		return
+	}
+
+	if err := removeDeadProxies(state, addrsBySource); err != nil {
+		fmt.Printf("removal failed: %v\n", err)
+		return
+	}
+
+	// Persist the exclude pattern so URL source refreshes cannot re-add
+	// matching proxies. Re-read to avoid clobbering the cache changes
+	// removeDeadProxies just wrote.
+	if urlState, err := readProxyURLState(); err == nil {
+		if addExcludePattern(urlState, pattern) {
+			if err := writeProxyURLState(urlState); err != nil {
+				fmt.Printf("warning: could not persist exclude pattern: %v\n", err)
+			}
+		}
+	}
+
+	fmt.Printf("Removed %d proxies matching %q. Pattern excluded from future URL fetches.\n", len(display), pattern)
+	fmt.Println("The running provider will apply the change via hot reload (no restart).")
+}
+
+// proxyExclude manages the URL-fetch exclude patterns:
+//
+//	proxy exclude                    list active patterns
+//	proxy exclude <pattern>          add a pattern
+//	proxy exclude <pattern> --remove delete a pattern
