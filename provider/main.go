@@ -39,6 +39,20 @@ const DefaultConnectUrl = "wss://connect.bringyour.com"
 // -ldflags "-X main.Version=$WARP_VERSION-$WARP_VERSION_CODE"
 var Version string
 
+var ErrTokenInvalid = errors.New("auth: token is invalid or expired")
+
+func validateJWTExpiry(byJwt string) error {
+	expParser := gojwt.NewParser()
+	if tok, _, parseErr := expParser.ParseUnverified(byJwt, gojwt.MapClaims{}); parseErr == nil {
+		if claims, ok := tok.Claims.(gojwt.MapClaims); ok {
+			if exp, ok := claims["exp"].(float64); ok && time.Now().Unix() > int64(exp)+30 {
+				return ErrTokenInvalid
+			}
+		}
+	}
+	return nil
+}
+
 func init() {
 	// debug.SetGCPercent(10)
 
@@ -389,11 +403,15 @@ func provide(opts docopt.Opts) {
 				if err == nil {
 					return byClientJwt, clientId, nil
 				}
-				if proxySettings != nil {
-					globalProxyFailureHistory.RecordFailure(proxySettings.Address)
-				}
-				authFailures++
-				retryDelay := time.Duration(500+mathrand.Intn(10000)) * time.Millisecond
+		if proxySettings != nil {
+			globalProxyFailureHistory.RecordFailure(proxySettings.Address)
+		}
+		authFailures++
+		if errors.Is(err, ErrTokenInvalid) {
+			fmt.Fprintf(os.Stderr, "FATAL [exit 78]: token invalid or expired — exiting so the startup script can refresh it\n")
+			os.Exit(78)
+		}
+		retryDelay := time.Duration(500+mathrand.Intn(10000)) * time.Millisecond
 				fmt.Printf("init proxy auth failed. Will retry in %.2fs\n", float64(retryDelay/time.Millisecond)/1000.0)
 				select {
 				case <-proxyCtx.Done():
@@ -660,6 +678,11 @@ func provideAuth(ctx context.Context, clientStrategy *connect.ClientStrategy, ap
 		return
 	}
 	byJwt := strings.TrimSpace(string(byJwtBytes))
+
+	if err := validateJWTExpiry(byJwt); err != nil {
+		returnErr = err
+		return
+	}
 
 	api := connect.NewBringYourApi(ctx, clientStrategy, apiUrl)
 
