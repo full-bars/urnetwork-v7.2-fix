@@ -15,6 +15,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/google/gopacket"
@@ -38,6 +39,12 @@ const defaultIpBufferSize = 1024
 // this is a contract with the devices and must not be raised.
 const DefaultMtu = 1440
 const Ipv4HeaderSizeWithoutExtensions = 20
+
+var activeConnectionCount int64
+
+func ActiveConnectionCount() int64 {
+	return atomic.LoadInt64(&activeConnectionCount)
+}
 const Ipv6HeaderSize = 40
 const UdpHeaderSize = 8
 const TcpHeaderSizeWithoutExtensions = 20
