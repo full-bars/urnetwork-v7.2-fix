@@ -2089,10 +2089,30 @@ func proxyAdd(opts docopt.Opts) {
 }
 
 func proxyRemove(opts docopt.Opts) {
+	if pattern, _ := opts.String("--match"); pattern != "" {
+		proxyRemoveMatch(pattern, opts)
+		return
+	}
+
 	proxyConfig := readProxyConfig()
 
 	if all, _ := opts.Bool("--all"); all {
 		clear(proxyConfig.Servers)
+
+		if state, err := readProxyState(); err == nil {
+			state.Proxies = map[string]ProxyEntry{}
+			state.NextID = 0
+			if err := writeProxyState(state); err != nil {
+				tlog("[proxy] warning: could not reset proxy.state: %v\n", err)
+			}
+		}
+		if urlState, err := readProxyURLState(); err == nil {
+			urlState.Cache = map[string]ProxyURLEntry{}
+			urlState.Sources = nil
+			if err := writeProxyURLState(urlState); err != nil {
+				tlog("[proxy] warning: could not clear proxy_url.json cache: %v\n", err)
+			}
+		}
 	} else {
 
 		allKeyAddress := []string{}
