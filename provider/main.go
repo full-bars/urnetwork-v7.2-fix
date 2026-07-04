@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"encoding/json"
 	"encoding/pem"
@@ -59,6 +60,9 @@ func validateJWTExpiry(byJwt string) error {
 var provideStartTime time.Time
 
 var proxyWarmupDone atomic.Bool
+
+var webhookClient = &http.Client{Timeout: 5 * time.Second}
+var containerIDRe = regexp.MustCompile("^[0-9a-f]{12}$")
 
 type ecoState int
 
@@ -342,35 +346,121 @@ func runHealthHeartbeat(ctx context.Context, startTime time.Time, profile string
 
 func runOutageWatcher(ctx context.Context, nodeName string, envWebhookURL string) {
 	const pollInterval = 30 * time.Second
+	const cooldown = 5 * time.Minute
+	const clearConfirm = 2
 	const startConfirm = 10
-
 	degraded := false
 	degradedCount := 0
-
+	clearCount := 0
+	var lastStartFire, lastClearFire time.Time
+	webhookURL := resolveAlertWebhook(envWebhookURL)
+	if webhookURL != "" {
+		tlog("[outage] watcher active node=%s webhook=configured\n", nodeName)
+	} else {
+		tlog("[outage] watcher active node=%s\n", nodeName)
+	}
 	ticker := time.NewTicker(pollInterval)
 	defer ticker.Stop()
-
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
 		}
-
+		if resolved := resolveAlertWebhook(envWebhookURL); resolved != webhookURL {
+			webhookURL = resolved
+			if webhookURL != "" {
+				tlog("[outage] webhook updated node=%s webhook=configured\n", nodeName)
+			} else {
+				tlog("[outage] webhook disabled node=%s\n", nodeName)
+			}
+		}
 		if connect.IsBackendDegraded() {
+			clearCount = 0
 			if !degraded {
 				degradedCount++
 				if degradedCount >= startConfirm {
 					degraded = true
-					fmt.Printf("[outage] backend degraded — holding existing connections\n")
+					tlog("[outage] backend degraded — holding existing connections, not accepting new ones\n")
+					if webhookURL != "" && time.Since(lastStartFire) >= cooldown {
+						lastStartFire = time.Now()
+						go fireWebhook(webhookURL, nodeName, "outage_start",
+							"Backend unreachable — provider holding existing connections but not accepting new ones.")
+					}
 				}
 			}
 		} else {
 			degradedCount = 0
 			if degraded {
-				degraded = false
-				fmt.Printf("[outage] backend recovered\n")
+				clearCount++
+				if clearCount >= clearConfirm {
+					degraded = false
+					clearCount = 0
+					tlog("[outage] backend recovered\n")
+					if webhookURL != "" && time.Since(lastClearFire) >= cooldown {
+						lastClearFire = time.Now()
+						go fireWebhook(webhookURL, nodeName, "outage_clear", "Backend connectivity restored.")
+					}
+				}
 			}
+		}
+	}
+}
+
+func fireWebhook(url, nodeName, event, message string) {
+	var payload []byte
+	var err error
+	switch {
+	case strings.Contains(url, "discord.com"), strings.Contains(url, "discordapp.com"):
+		line := fmt.Sprintf("URnetwork [%s] node=%s: %s", event, nodeName, message)
+		payload, err = json.Marshal(map[string]string{"content": line})
+	case strings.Contains(url, "hooks.slack.com"):
+		line := fmt.Sprintf("URnetwork [%s] node=%s: %s", event, nodeName, message)
+		payload, err = json.Marshal(map[string]string{"text": line})
+	default:
+		payload, err = json.Marshal(map[string]string{
+			"event":     event,
+			"node":      nodeName,
+			"timestamp": time.Now().UTC().Format(time.RFC3339),
+			"message":   message,
+		})
+	}
+	if err != nil {
+		tlog("[webhook] marshal failed: %v\n", err)
+		return
+	}
+	resp, err := webhookClient.Post(url, "application/json", bytes.NewReader(payload))
+	if err != nil {
+		tlog("[webhook] POST failed: %v\n", err)
+		return
+	}
+	resp.Body.Close()
+}
+
+func paceMonitor(ctx context.Context) {
+	ticker := time.NewTicker(30 * time.Second)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+		}
+		up, _, _, _, connecting := connect.ProxyHealthSnapshot()
+		total := connect.ProxyHealthCount()
+		if total < 5 {
+			continue
+		}
+		pct := float64(up) * 100 / float64(total)
+		connectingN := len(connecting)
+		if up*100/total > 90 && connectingN < 5 {
+			proxyWarmupDone.Store(true)
+			return
+		}
+		if connectingN > 10 && pct < 50 {
+			tlog("⚠ [pace] warmup: %d/%d up (%.0f%%), %d connecting\n", up, total, pct, connectingN)
+		} else {
+			tlog("[pace] warmup: %d/%d up (%.0f%%), %d connecting\n", up, total, pct, connectingN)
 		}
 	}
 }
@@ -413,6 +503,9 @@ func provide(opts docopt.Opts) {
 	go runOutageWatcher(ctx, os.Getenv("URNETWORK_NODE_NAME"), os.Getenv("URNETWORK_ALERT_WEBHOOK"))
 	go runHealthHeartbeat(ctx, provideStartTime, os.Getenv("URNETWORK_PROFILE"))
 	go runJWTRefresher(ctx, apiUrl)
+	go runEarningWindows(ctx)
+	go runProfitHeartbeat(ctx)
+	go paceMonitor(ctx)
 
 	provideWithProxy := func(proxySettings *connect.ProxySettings) {
 		proxyCtx, proxyCancel := context.WithCancel(ctx)
