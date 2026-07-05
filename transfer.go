@@ -955,7 +955,9 @@ func (self *Client) run() {
 				select {
 				case err := <-ack:
 					if err == nil {
-						self.log.Infof("[c]ping\n")
+						if self.log.V(1).Enabled() {
+							self.log.Infof("[c]ping\n")
+						}
 					} else {
 						self.log.Infof("[c]ping err = %s\n", err)
 					}

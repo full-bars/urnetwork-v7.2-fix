@@ -419,6 +419,17 @@ func isBetterMode(current TransportMode, other TransportMode) bool {
 	return transportModePreferences[current] < transportModePreferences[other]
 }
 
+func (self *PlatformTransport) proxyIndex() (int, bool) {
+	if self.clientStrategy == nil || self.clientStrategy.settings == nil {
+		return 0, false
+	}
+	ps := self.clientStrategy.settings.ProxySettings
+	if ps == nil {
+		return 0, true
+	}
+	return ps.Index, true
+}
+
 func (self *PlatformTransport) runH1(initialTimeout time.Duration) {
 	// connect and update route manager for this transport
 	defer self.cancel()
@@ -523,6 +534,8 @@ func (self *PlatformTransport) runH1(initialTimeout time.Duration) {
 			ws, err = connect()
 		}
 		if err != nil {
+			lastBackendFailNano.Store(time.Now().UnixNano())
+			consecutiveBackendFails.Add(1)
 			if ok, suppressed := shouldLogAuthErr(); ok {
 				if suppressed > 0 {
 					self.log.Infof("[t]auth error %s = %s (%d suppressed)\n", clientId, err, suppressed)
@@ -537,6 +550,8 @@ func (self *PlatformTransport) runH1(initialTimeout time.Duration) {
 				continue
 			}
 		}
+		lastBackendFailNano.Store(0)
+		consecutiveBackendFails.Store(0)
 
 		c := func() {
 			defer ws.Close()
@@ -620,18 +635,23 @@ func (self *PlatformTransport) runH1(initialTimeout time.Duration) {
 			self.routeManager.UpdateTransport(sendTransport, []Route{exportedSend})
 			self.routeManager.UpdateTransport(receiveTransport, []Route{receive})
 
+			atomic.AddInt64(&activeProxyConnections, 1)
+			if idx, ok := self.proxyIndex(); ok {
+				markProxyUp(idx)
+			}
+
 			// scoped to the writer goroutine; canceled when it exits so the
 			// outer defer can drain `send` without racing the writer.
 			writerCtx, writerCancel := context.WithCancel(context.Background())
 			defer func() {
+				atomic.AddInt64(&activeProxyConnections, -1)
+				if idx, ok := self.proxyIndex(); ok {
+					markProxyDown(idx)
+					RecordProxyTransportDrop(idx, nil)
+				}
 				self.routeManager.RemoveTransport(sendTransport)
 				self.routeManager.RemoveTransport(receiveTransport)
 				handleCancel()
-				// once the writer has exited and no new writes can be routed,
-				// drain any pooled messages still sitting in send. a stale
-				// reflect.Select in MultiRouteSelector that captured our
-				// route snapshot may still resolve after RemoveTransport;
-				// drain again briefly to catch any final messages.
 				<-writerCtx.Done()
 				drain(send)
 				time.Sleep(time.Millisecond)
@@ -1131,6 +1151,8 @@ func (self *PlatformTransport) runH3(ptMode TransportMode, initialTimeout time.D
 			connStream, err = connect()
 		}
 		if err != nil {
+			lastBackendFailNano.Store(time.Now().UnixNano())
+			consecutiveBackendFails.Add(1)
 			if ok, suppressed := shouldLogAuthErr(); ok {
 				if suppressed > 0 {
 					self.log.Infof("[t]auth error %s = %s (%d suppressed)\n", clientId, err, suppressed)
@@ -1145,6 +1167,9 @@ func (self *PlatformTransport) runH3(ptMode TransportMode, initialTimeout time.D
 				continue
 			}
 		}
+		lastBackendFailNano.Store(0)
+		consecutiveBackendFails.Store(0)
+
 		conn := connStream.conn
 		stream := connStream.stream
 
@@ -1193,18 +1218,23 @@ func (self *PlatformTransport) runH3(ptMode TransportMode, initialTimeout time.D
 			self.routeManager.UpdateTransport(sendTransport, []Route{send})
 			self.routeManager.UpdateTransport(receiveTransport, []Route{receive})
 
+			atomic.AddInt64(&activeProxyConnections, 1)
+			if idx, ok := self.proxyIndex(); ok {
+				markProxyUp(idx)
+			}
+
 			// scoped to the writer goroutine; canceled when it exits so the
 			// outer defer can drain `send` without racing the writer.
 			h3WriterCtx, h3WriterCancel := context.WithCancel(context.Background())
 			defer func() {
+				atomic.AddInt64(&activeProxyConnections, -1)
+				if idx, ok := self.proxyIndex(); ok {
+					markProxyDown(idx)
+					RecordProxyTransportDrop(idx, nil)
+				}
 				self.routeManager.RemoveTransport(sendTransport)
 				self.routeManager.RemoveTransport(receiveTransport)
 				handleCancel()
-				// note `send` is not closed. drain any pooled bytes still
-				// queued after the writer exits and RemoveTransport has
-				// stopped new route writes. a stale reflect.Select may
-				// still resolve after RemoveTransport; drain again briefly
-				// to catch any final messages.
 				<-h3WriterCtx.Done()
 				drain(send)
 				time.Sleep(time.Millisecond)
