@@ -47,11 +47,25 @@ jobs:
           -ldflags "-s -w -X main.Version=${VERSION}" \
           -o bin/${{ matrix.goos }}/${{ matrix.goarch }}/provider ./provider/
 
+      - name: Build hub
+        run: |
+          VERSION=${GITHUB_REF_NAME:-v7.2.0-fix.1}
+          GOOS=${{ matrix.goos }} GOARCH=${{ matrix.goarch }} CGO_ENABLED=0 \
+          go build -trimpath \
+          -ldflags "-s -w -X main.Version=${VERSION}" \
+          -o bin/${{ matrix.goos }}/${{ matrix.goarch }}/hub ./hub/
+
       - name: Upload provider artifact
         uses: actions/upload-artifact@v4
         with:
           name: provider-${{ matrix.goarch }}
           path: bin/${{ matrix.goos }}/${{ matrix.goarch }}/provider
+
+      - name: Upload hub artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: hub-${{ matrix.goarch }}
+          path: bin/${{ matrix.goos }}/${{ matrix.goarch }}/hub
 
   create-release:
     name: Create Release
@@ -75,12 +89,29 @@ jobs:
           name: provider-arm64
           path: release_tmp/linux/arm64/
 
+      - name: Download hub amd64 artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: hub-amd64
+          path: hub_tmp/amd64/
+
+      - name: Download hub arm64 artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: hub-arm64
+          path: hub_tmp/arm64/
+
       - name: Prepare binaries
         run: |
           VERSION=${GITHUB_REF_NAME:-latest}
           find release_tmp -name "provider*" -type f -exec chmod +x {} \;
           mv release_tmp/linux/amd64/provider-amd64 release_tmp/linux/amd64/provider 2>/dev/null || true
           mv release_tmp/linux/arm64/provider-arm64 release_tmp/linux/arm64/provider 2>/dev/null || true
+          find hub_tmp -name "hub*" -type f -exec chmod +x {} \;
+          mv hub_tmp/amd64/hub-amd64 hub_tmp/amd64/hub 2>/dev/null || true
+          mv hub_tmp/arm64/hub-arm64 hub_tmp/arm64/hub 2>/dev/null || true
+          cp hub_tmp/amd64/hub urnetwork-hub-${VERSION}-linux-amd64
+          cp hub_tmp/arm64/hub urnetwork-hub-${VERSION}-linux-arm64
 
       - name: Create provider tarball
         run: |
@@ -108,6 +139,8 @@ jobs:
         with:
           files: |
             urnetwork-provider-*.tar.gz
+            urnetwork-hub-*-linux-amd64
+            urnetwork-hub-*-linux-arm64
           draft: false
           prerelease: ${{ contains(github.ref, '-rc') || contains(github.ref, '-alpha') || contains(github.ref, '-beta') }}
           body_path: ${{ steps.body_src.outputs.path }}
