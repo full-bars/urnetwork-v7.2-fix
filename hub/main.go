@@ -1409,6 +1409,16 @@ function parseSortValue(s) {
   return s;
 }
 function cmpNode(a,b,dir){var pa=parseSortValue(a),pb=parseSortValue(b);if(typeof pa==='number'&&typeof pb==='number')return dir*(pa-pb);return dir*String(a).localeCompare(String(b),undefined,{numeric:true});}
+function reapplySort() {
+  var cols = Object.keys(sortState);
+  if (cols.length === 0) return;
+  var col = cols[0], dir = sortState[col];
+  var tbody = document.querySelector('#node-table tbody');
+  if (!tbody) return;
+  var rows = Array.from(tbody.querySelectorAll('tr.expandable'));
+  rows.sort(function(a,b){return cmpNode(a.cells[getColIndex(col)].textContent.trim(), b.cells[getColIndex(col)].textContent.trim(), dir);});
+  rows.forEach(function(r){tbody.appendChild(r);});
+}
 
 // === Drawer ===
 var drawerNodeId = null, proxyDrawer = {};
@@ -1458,7 +1468,11 @@ function toggleRefresh() { if (document.getElementById('auto-refresh').checked) 
 // its own with native backoff, no custom reconnect logic needed here.
 if (window.EventSource) {
   var liveEvents = new EventSource('/api/events');
-  liveEvents.onmessage = function() { refreshDashboard(); };
+  var sseTimer = null;
+  liveEvents.onmessage = function() {
+    if (sseTimer !== null) return;
+    sseTimer = setTimeout(function() { sseTimer = null; refreshDashboard(); }, 5000);
+  };
 }
 
 function refreshDashboard() {
@@ -1500,6 +1514,7 @@ function refreshDashboard() {
     document.querySelectorAll('.card')[3].innerHTML = '<div class="label">Earning</div><div class="value">'+(totalUp>0?(totalEarning/totalUp*100).toFixed(1):'0')+'%</div><div class="sub">'+totalEarning+' / '+totalUp+' up</div>';
     document.querySelectorAll('.card')[4].innerHTML = '<div class="label">Active Clients</div><div class="value">'+totalClients+'</div><div class="sub">'+fmtBytes(totalRX)+' RX / '+fmtBytes(totalTX)+' TX</div>';
     applyFilter();
+    reapplySort();
   }).catch(function(e){var fc=document.getElementById('filter-count');if(fc)fc.textContent='Error: '+(e&&e.message||e||'unknown');}).then(function(){refreshing=false;});
 }
 function removeNode(nodeId) {
